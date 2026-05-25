@@ -80,6 +80,7 @@ async fn handle_input(input: &str, history: &mut Vec<Message>) {
 
             let json: serde_json::Value = res.json().await.unwrap_or_default();
 
+            // This is for Debugging
             if !status.is_success() {
                 println!("API Error Status: {}", status);
                 println!("API Error Body: {:#}", json);
