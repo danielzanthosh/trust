@@ -11,6 +11,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
+use std::fs;
 use std::io::{self, Write};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -97,12 +98,22 @@ async fn handle_input(input: &str, history: &mut Vec<Message>) {
                 role: "assistant".to_string(),
                 content: ai_message.to_string(),
             });
+
+            save_history(history);
         }
 
         Err(e) => {
             eprintln!("Request Error: {}", e);
         }
     }
+}
+
+fn save_history(history: &Vec<Message>) {
+    fs::create_dir_all("memory").unwrap();
+
+    let json = serde_json::to_string(history).unwrap();
+
+    fs::write("memory/history.json", json).unwrap();
 }
 
 fn credits() {
