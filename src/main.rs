@@ -39,10 +39,6 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
     let base_url = env::var("BASE_URL").unwrap_or_default();
     let model = env::var("MODEL").unwrap_or_default();
 
-    if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&full_message) {
-        run_tool(tool_call);
-    }
-
     history.push(Message {
         role: "user".to_string(),
         content: input.to_string(),
@@ -114,6 +110,10 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
             }
 
             println!();
+
+            if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&full_message) {
+                run_tool(tool_call);
+            }
 
             history.push(Message {
                 role: "assistant".to_string(),
@@ -244,34 +244,13 @@ fn credits() {
     println!("{}\n", "━".repeat(60).bright_black());
 }
 
-fn intro() {
-    println!("{}", ".------..------..------..------..------.".red());
-    println!(
-        "{}",
-        "|T.--. ||R.--. ||U.--. ||S.--. ||T.--. |".bright_red()
-    );
-    println!("{}", "| :/\\: || :(): || (\\/) || :/\\: || :/\\: |".red());
-    println!("{}", "| (__) || ()() || :\\/: || :\\/: || (__) |".red());
-    println!(
-        "{}",
-        "| '--'T|| '--'R|| '--'U|| '--'S|| '--'T|".bright_red()
-    );
-    println!("{}", "`------'`------'`------'`------'`------'".red());
-
-    println!(
-        "{}",
-        "Commands: /list, /chat <name>, /delete <name>, /clear, /exit\n".bright_red()
-    );
-}
-
 #[tokio::main]
 async fn main() {
     dotenv().ok();
     intro();
 
-    if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&full_message) {
-        run_tool(tool_call);
-    }
+    let mut current_chat = "default".to_string();
+    let mut history = load_history(&current_chat);
 
     history.push(Message {
         role: "system".to_string(),
@@ -299,9 +278,6 @@ async fn main() {
     "#
         .to_string(),
     });
-
-    let mut current_chat = "default".to_string();
-    let mut history = load_history(&current_chat);
 
     loop {
         print!("{} > ", current_chat.bright_cyan());
@@ -368,4 +344,31 @@ async fn main() {
 
         handle_input(input, &current_chat, &mut history).await;
     }
+}
+
+//    .------..------..------..------..------.
+//    |T.--. ||R.--. ||U.--. ||S.--. ||T.--. |
+//    | :/\: || :(): || (\/) || :/\: || :/\: |
+//    | (__) || ()() || :\/: || :\/: || (__) |
+//    | '--'T|| '--'R|| '--'U|| '--'S|| '--'T|
+//    `------'`------'`------'`------'`------'
+
+fn intro() {
+    println!("{}", ".------..------..------..------..------.".red());
+    println!(
+        "{}",
+        "|T.--. ||R.--. ||U.--. ||S.--. ||T.--. |".bright_red()
+    );
+    println!("{}", "| :/\\: || :(): || (\\/) || :/\\: || :/\\: |".red());
+    println!("{}", "| (__) || ()() || :\\/: || :\\/: || (__) |".red());
+    println!(
+        "{}",
+        "| '--'T|| '--'R|| '--'U|| '--'S|| '--'T|".bright_red()
+    );
+    println!("{}", "`------'`------'`------'`------'`------'".red());
+
+    println!(
+        "{}",
+        "Commands: /list, /chat <name>, /delete <name>, /clear, /exit\n".bright_red()
+    );
 }
