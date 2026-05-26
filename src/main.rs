@@ -44,6 +44,13 @@ async fn main() {
             break;
         } else if input == "/credits" {
             credits();
+        } else if input.starts_with("/newchat ") {
+            let name = input.replace("/newchat ", "").trim().to_string();
+
+            current_chat = name;
+            history = Vec::new();
+
+            println!("Started new chat: {}", current_chat.bright_cyan());
         } else {
             handle_input(input, &current_chat, &mut history).await;
         }
