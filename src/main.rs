@@ -5,7 +5,7 @@
 // Fast, Secure, Memory Safety
 // Features: Chat History, Infinite Memory
 
-use colored::Colorize;
+use colored::*;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -19,6 +19,19 @@ use std::io::{self, Write};
 struct Message {
     role: String,
     content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ToolCall {
+    r#type: String,
+    tool: String,
+    args: ToolArgs,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ToolArgs {
+    path: String,
+    content: Option<String>,
 }
 
 async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message>) {
@@ -174,6 +187,31 @@ fn delete_chat(chat_name: &str) {
     }
 }
 
+fn run_tool(tool_call: ToolCall) {
+    match tool_call.tool.as_str() {
+        "write_file" => {
+            let path = tool_call.args.path;
+
+            if !path.starts_with("outputs/") {
+                println!("{}", "Blocked unsafe path!".bright_red());
+
+                return;
+            }
+
+            let content = tool_call.args.content.unwrap_or_default();
+
+            fs::create_dir_all("outputs").unwrap();
+
+            fs::write(&path, content).unwrap();
+
+            println!("Saved file: {}", path.bright_green());
+        }
+
+        _ => {
+            println!("{}", "Unknown tool.".bright_red());
+        }
+    }
+}
 fn credits() {
     println!("\n{}", "━".repeat(60).bright_black());
     println!("🤖 {}", "Terminal AI Assistant".bold().bright_cyan());
@@ -202,12 +240,61 @@ fn credits() {
     println!("{}\n", "━".repeat(60).bright_black());
 }
 
+fn intro() {
+    println!("{}", ".------..------..------..------..------.".red());
+    println!(
+        "{}",
+        "|T.--. ||R.--. ||U.--. ||S.--. ||T.--. |".bright_red()
+    );
+    println!("{}", "| :/\\: || :(): || (\\/) || :/\\: || :/\\: |".red());
+    println!("{}", "| (__) || ()() || :\\/: || :\\/: || (__) |".red());
+    println!(
+        "{}",
+        "| '--'T|| '--'R|| '--'U|| '--'S|| '--'T|".bright_red()
+    );
+    println!("{}", "`------'`------'`------'`------'`------'".red());
+
+    println!(
+        "{}",
+        "Commands: /list, /chat <name>, /delete <name>, /clear, /exit\n".bright_red()
+    );
+}
+
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    credits();
+    intro();
 
-    println!("Commands: /list, /chat <name>, /delete <name>, /clear, /exit\n");
+    if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&full_message) {
+        run_tool(tool_call);
+    }
+
+    history.push(Message {
+        role: "system".to_string(),
+        content: r#"
+    You are TRUST.
+
+    You may use tools by replying ONLY with JSON.
+
+    Example:
+
+    {
+      "type": "tool_call",
+      "tool": "write_file",
+      "args": {
+        "path": "outputs/test.md",
+        "content": "Hello world"
+      }
+    }
+
+    Allowed tools:
+    - write_file
+
+    Never pretend to save files.
+    Only use JSON when calling tools.
+    "#
+        .to_string(),
+    });
 
     let mut current_chat = "default".to_string();
     let mut history = load_history(&current_chat);
