@@ -1,4 +1,5 @@
-name: Rust
+```yml
+name: Rust CI 🚀
 
 on:
   push:
@@ -10,13 +11,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  rust:
 
-    runs-on: debian-latest
+    runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Cargo
+      uses: Swatinem/rust-cache@v2
+
+    - name: Build Project
       run: cargo build --verbose
-    - name: Run tests
+
+    - name: Run Tests
       run: cargo test --verbose
+
+    - name: Check Formatting
+      run: cargo fmt --check
+
+    - name: Run Clippy
+      run: cargo clippy -- -D warnings
+
+    - name: Finished Successfully
+      run: echo "Rust project built successfully 🚀"
+```
