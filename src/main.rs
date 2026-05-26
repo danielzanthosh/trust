@@ -30,7 +30,8 @@ async fn main() {
         "Please check the README for instructions.".bright_black()
     );
 
-    let mut history: Vec<Message> = Vec::new();
+    let mut current_chat = "default".to_string();
+    let mut history: Vec<Message> = load_history(&current_chat);
 
     loop {
         print!("Enter your message: ");
@@ -116,6 +117,14 @@ fn save_history(history: &Vec<Message>) {
     fs::write("memory/history.json", json).unwrap();
 }
 
+fn load_history() -> Vec<Message> {
+    let data = fs::read_to_string("memory/history.json");
+    match data {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| Vec::new()),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn credits() {
     println!("\n{}", "━".repeat(60).bright_black());
     println!("🤖 {}", "Terminal AI Assistant".bold().bright_cyan());
@@ -132,7 +141,7 @@ fn credits() {
     println!(
         "{} {}",
         "Powered by:".bright_magenta().bold(),
-        "Rust 🦀".bright_red() // Note: Use .bright_red() if your colored version doesn't have orange
+        "Rust 🦀".bright_red()
     );
     println!(
         "{}  {}",

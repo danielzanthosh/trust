@@ -3,7 +3,6 @@
 A fast, lightweight AI assistant that runs directly inside the terminal.
 
 Built with Rust 🦀 for speed, safety, and performance.
-
 ## Features
 
 * OpenAI-compatible API support
