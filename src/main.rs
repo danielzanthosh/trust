@@ -64,6 +64,10 @@ async fn main() {
             );
         } else if input == "/listchats" {
             list_chats();
+        } else if input.starts_with("/deletechat ") {
+            let name = input.replace("/deletechat ", "").trim().to_string();
+
+            delete_chat(&name);
         } else {
             handle_input(input, &current_chat, &mut history).await;
         }
@@ -176,6 +180,23 @@ fn list_chats() {
         }
     }
 }
+
+fn delete_chat(chat_name: &str) {
+    let path = chat_path(chat_name);
+
+    let result = fs::remove_file(path);
+
+    match result {
+        Ok(_) => {
+            println!("Deleted chat: {}", chat_name.bright_red());
+        }
+
+        Err(_) => {
+            println!("Chat not found: {}", chat_name.bright_red());
+        }
+    }
+}
+
 fn credits() {
     println!("\n{}", "━".repeat(60).bright_black());
     println!("🤖 {}", "Terminal AI Assistant".bold().bright_cyan());
