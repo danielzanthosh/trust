@@ -30,7 +30,7 @@ async fn main() {
         "Please check the README for instructions.".bright_black()
     );
 
-    let mut current_chat = "default".to_string();
+    let current_chat = "default".to_string();
     let mut history: Vec<Message> = load_history(&current_chat);
 
     loop {
@@ -45,12 +45,12 @@ async fn main() {
         } else if input == "/credits" {
             credits();
         } else {
-            handle_input(input, &mut history).await;
+            handle_input(input, &current_chat, &mut history).await;
         }
     }
 }
 
-async fn handle_input(input: &str, history: &mut Vec<Message>) {
+async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message>) {
     let api_key = env::var("API_KEY").unwrap_or_default();
     let base_url = env::var("BASE_URL").unwrap_or_default();
     let model = env::var("MODEL").unwrap_or_default();
@@ -99,7 +99,7 @@ async fn handle_input(input: &str, history: &mut Vec<Message>) {
                 content: ai_message.to_string(),
             });
 
-            save_history(history);
+            save_history(current_chat, history);
         }
 
         Err(e) => {
@@ -108,16 +108,21 @@ async fn handle_input(input: &str, history: &mut Vec<Message>) {
     }
 }
 
-fn save_history(history: &Vec<Message>) {
-    fs::create_dir_all("memory").unwrap();
-
-    let json = serde_json::to_string(history).unwrap();
-
-    fs::write("memory/history.json", json).unwrap();
+fn chat_path(chat_name: &str) -> String {
+    format!("memory/{}.json", chat_name)
 }
 
-fn load_history() -> Vec<Message> {
-    let data = fs::read_to_string("memory/history.json");
+fn save_history(chat_name: &str, history: &Vec<Message>) {
+    fs::create_dir_all("memory").unwrap();
+
+    let json = serde_json::to_string_pretty(history).unwrap();
+
+    fs::write(chat_path(chat_name), json).unwrap();
+}
+
+fn load_history(chat_name: &str) -> Vec<Message> {
+    let data = fs::read_to_string(chat_path(chat_name));
+
     match data {
         Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| Vec::new()),
         Err(_) => Vec::new(),
