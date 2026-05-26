@@ -14,6 +14,7 @@ use serde_json::json;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::path;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Message {
@@ -218,7 +219,7 @@ fn delete_chat(chat_name: &str) {
     }
 }
 
-fn run_tool(tool_call: ToolCall) {
+fn run_tool(tool_call: ToolCall) -> String {
     match tool_call.tool.as_str() {
         "write_file" => {
             let path = tool_call.args.path;
@@ -242,6 +243,8 @@ fn run_tool(tool_call: ToolCall) {
             println!("{}", "Unknown tool.".bright_red());
         }
     }
+    return format!("Saved file: {}", path);
+    return "Blocked unsafe path".to_string();
 }
 fn credits() {
     println!("\n{}", "━".repeat(60).bright_black());
