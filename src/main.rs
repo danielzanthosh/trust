@@ -7,6 +7,7 @@
 
 use colored::Colorize;
 use dotenvy::dotenv;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,60 +19,6 @@ use std::io::{self, Write};
 struct Message {
     role: String,
     content: String,
-}
-
-#[tokio::main]
-async fn main() {
-    dotenv().ok();
-    println!("{}", "Welcome to TRUST!".bright_blue());
-    println!("{}", "This is a dev version".bright_black());
-    println!(
-        "{}",
-        "Please check the README for instructions.".bright_black()
-    );
-
-    let mut current_chat = "default".to_string();
-    let mut history: Vec<Message> = load_history(&current_chat);
-
-    loop {
-        print!("Enter your message: ");
-        io::stdout().flush().unwrap();
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let input = input.trim();
-        if input == "/exit" {
-            println!("{}", "Goodbye!".blue());
-            break;
-        } else if input == "/credits" {
-            credits();
-        } else if input.starts_with("/newchat ") {
-            let name = input.replace("/newchat ", "").trim().to_string();
-
-            current_chat = name;
-            history = Vec::new();
-
-            println!("Started new chat: {}", current_chat.bright_cyan());
-        } else if input.starts_with("/loadchat ") {
-            let name = input.replace("/loadchat ", "").trim().to_string();
-
-            current_chat = name.clone();
-            history = load_history(&current_chat);
-
-            println!(
-                "Loaded chat: {} ({} messages)",
-                current_chat.bright_cyan(),
-                history.len()
-            );
-        } else if input == "/listchats" {
-            list_chats();
-        } else if input.starts_with("/deletechat ") {
-            let name = input.replace("/deletechat ", "").trim().to_string();
-
-            delete_chat(&name);
-        } else {
-            handle_input(input, &current_chat, &mut history).await;
-        }
-    }
 }
 
 async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message>) {
@@ -88,7 +35,8 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
 
     let body = json!({
         "model": model,
-        "messages": history
+        "messages": history,
+        "stream": true
     });
 
     let url = format!("{}/v1/chat/completions", base_url);
@@ -104,23 +52,55 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
         Ok(res) => {
             let status = res.status();
 
-            let json: serde_json::Value = res.json().await.unwrap_or_default();
-
             if !status.is_success() {
                 println!("API Error Status: {}", status);
-                println!("API Error Body: {:#}", json);
                 return;
             }
 
-            let ai_message = json["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or("No message found");
+            let mut stream = res.bytes_stream();
 
-            println!("{}", ai_message.bright_green());
+            let mut full_message = String::new();
+
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        let text = String::from_utf8_lossy(&chunk);
+
+                        for line in text.lines() {
+                            if line.starts_with("data: ") {
+                                let data = line.replace("data: ", "");
+
+                                if data == "[DONE]" {
+                                    break;
+                                }
+
+                                let parsed: serde_json::Value =
+                                    serde_json::from_str(&data).unwrap_or_default();
+
+                                let content = parsed["choices"][0]["delta"]["content"]
+                                    .as_str()
+                                    .unwrap_or("");
+
+                                print!("{}", content.bright_green());
+
+                                io::stdout().flush().unwrap();
+
+                                full_message.push_str(content);
+                            }
+                        }
+                    }
+
+                    Err(e) => {
+                        println!("Stream Error: {}", e);
+                    }
+                }
+            }
+
+            println!();
 
             history.push(Message {
                 role: "assistant".to_string(),
-                content: ai_message.to_string(),
+                content: full_message,
             });
 
             save_history(current_chat, history);
@@ -223,4 +203,81 @@ fn credits() {
             .bright_blue()
     );
     println!("{}\n", "━".repeat(60).bright_black());
+}
+
+#[tokio::main]
+async fn main() {
+    dotenv().ok();
+    credits();
+
+    println!("Commands: /list, /chat <name>, /delete <name>, /clear, /exit\n");
+
+    let mut current_chat = "default".to_string();
+    let mut history = load_history(&current_chat);
+
+    loop {
+        print!("{} > ", current_chat.bright_cyan());
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            eprintln!("Failed to read input");
+            continue;
+        }
+
+        let input = input.trim();
+
+        if input.is_empty() {
+            continue;
+        }
+
+        if input == "/exit" || input == "/quit" {
+            break;
+        }
+
+        if input == "/list" {
+            list_chats();
+            continue;
+        }
+
+        if input == "/clear" {
+            history.clear();
+            save_history(&current_chat, &history);
+            println!("Cleared chat: {}", current_chat.bright_red());
+            continue;
+        }
+
+        if let Some(chat_name) = input.strip_prefix("/chat ") {
+            let chat_name = chat_name.trim();
+
+            if chat_name.is_empty() {
+                println!("Usage: /chat <name>");
+                continue;
+            }
+
+            current_chat = chat_name.to_string();
+            history = load_history(&current_chat);
+            println!("Switched to chat: {}", current_chat.bright_cyan());
+            continue;
+        }
+
+        if let Some(chat_name) = input.strip_prefix("/delete ") {
+            let chat_name = chat_name.trim();
+
+            if chat_name.is_empty() {
+                println!("Usage: /delete <name>");
+                continue;
+            }
+
+            delete_chat(chat_name);
+
+            if chat_name == current_chat {
+                history.clear();
+            }
+
+            continue;
+        }
+
+        handle_input(input, &current_chat, &mut history).await;
+    }
 }
