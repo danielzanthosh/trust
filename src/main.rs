@@ -39,6 +39,29 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
     let base_url = env::var("BASE_URL").unwrap_or_default();
     let model = env::var("MODEL").unwrap_or_default();
 
+    if api_key.trim().is_empty() {
+        eprintln!("Missing API_KEY. Add it to your .env file or environment variables.");
+        return;
+    }
+
+    if base_url.trim().is_empty() {
+        eprintln!("Missing BASE_URL. Example: BASE_URL=https://api.openai.com");
+        return;
+    }
+
+    if model.trim().is_empty() {
+        eprintln!("Missing MODEL. Example: MODEL=gpt-4o-mini");
+        return;
+    }
+
+    let base_url = base_url.trim().trim_end_matches('/');
+    let url =
+        if base_url.ends_with("/v1/chat/completions") || base_url.ends_with("/chat/completions") {
+            base_url.to_string()
+        } else {
+            format!("{}/v1/chat/completions", base_url)
+        };
+
     history.push(Message {
         role: "user".to_string(),
         content: input.to_string(),
@@ -52,10 +75,8 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
         "stream": true
     });
 
-    let url = format!("{}/v1/chat/completions", base_url);
-
     let response = client
-        .post(url)
+        .post(&url)
         .bearer_auth(api_key)
         .json(&body)
         .send()
@@ -125,6 +146,12 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
 
         Err(e) => {
             eprintln!("Request Error: {}", e);
+            if e.is_builder() {
+                eprintln!(
+                    "This usually means BASE_URL is not a valid absolute URL. Current request URL: {}",
+                    url
+                );
+            }
         }
     }
 }
