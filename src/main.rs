@@ -14,7 +14,7 @@ use serde_json::json;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::path;
+use std::process::Command;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Message {
@@ -31,8 +31,11 @@ struct ToolCall {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ToolArgs {
-    path: String,
+    path: Option<String>,
     content: Option<String>,
+    url: Option<String>,
+    app: Option<String>,
+    command: Option<String>,
 }
 
 async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message>) {
@@ -134,7 +137,14 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
             println!();
 
             if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&full_message) {
-                run_tool(tool_call);
+                let tool_result = run_tool(tool_call);
+
+                println!("{}", tool_result.bright_magenta());
+
+                history.push(Message {
+                    role: "tool".to_string(),
+                    content: tool_result,
+                });
             }
 
             history.push(Message {
@@ -219,32 +229,133 @@ fn delete_chat(chat_name: &str) {
     }
 }
 
+fn open_app(app: &str, url: Option<String>) -> String {
+    let normalized_app = app.trim().to_lowercase();
+
+    let executable = match normalized_app.as_str() {
+        "chrome" | "google chrome" => "chrome",
+        "edge" | "microsoft edge" => "msedge",
+        "firefox" => "firefox",
+        "notepad" => "notepad",
+        "calculator" | "calc" => "calc",
+        "explorer" | "file explorer" => "explorer",
+        "paint" | "mspaint" => "mspaint",
+        "wordpad" => "write",
+        "vscode" | "vs code" | "code" => "code",
+        _ => {
+            return format!(
+                "Blocked app: {}. Allowed apps: chrome, edge, firefox, notepad, calculator, explorer, paint, wordpad, vscode",
+                app
+            );
+        }
+    };
+
+    if let Some(url) = url {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return "Blocked unsafe URL. Only http:// and https:// URLs are allowed.".to_string();
+        }
+
+        match Command::new("cmd")
+            .args(["/C", "start", "", executable, &url])
+            .spawn()
+        {
+            Ok(_) => format!("Opened {} with URL: {}", app, url),
+            Err(e) => format!("Failed to open {}: {}", app, e),
+        }
+    } else {
+        match Command::new("cmd")
+            .args(["/C", "start", "", executable])
+            .spawn()
+        {
+            Ok(_) => format!("Opened {}", app),
+            Err(e) => format!("Failed to open {}: {}", app, e),
+        }
+    }
+}
+
+fn run_safe_command(command: &str) -> String {
+    let normalized_command = command.trim().to_lowercase();
+
+    let args: &[&str] = match normalized_command.as_str() {
+        "date" => &["/C", "date", "/T"],
+        "time" => &["/C", "time", "/T"],
+        "whoami" => &["/C", "whoami"],
+        "hostname" => &["/C", "hostname"],
+        "version" | "ver" => &["/C", "ver"],
+        "list_outputs" | "dir outputs" => &["/C", "dir", "outputs"],
+        "list_memory" | "dir memory" => &["/C", "dir", "memory"],
+        _ => {
+            return format!(
+                "Blocked command: {}. Allowed safe commands: date, time, whoami, hostname, ver, list_outputs, list_memory",
+                command
+            );
+        }
+    };
+
+    match Command::new("cmd").args(args).output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+            if output.status.success() {
+                if stdout.is_empty() {
+                    "Command completed successfully with no output".to_string()
+                } else {
+                    stdout
+                }
+            } else if stderr.is_empty() {
+                format!("Command failed with status: {}", output.status)
+            } else {
+                format!("Command failed: {}", stderr)
+            }
+        }
+        Err(e) => format!("Failed to run safe command: {}", e),
+    }
+}
+
 fn run_tool(tool_call: ToolCall) -> String {
     match tool_call.tool.as_str() {
         "write_file" => {
-            let path = tool_call.args.path;
+            let Some(path) = tool_call.args.path else {
+                return "Missing path for write_file".to_string();
+            };
 
             if !path.starts_with("outputs/") {
-                println!("{}", "Blocked unsafe path!".bright_red());
-
-                return;
+                return "Blocked unsafe path".to_string();
             }
 
             let content = tool_call.args.content.unwrap_or_default();
 
-            fs::create_dir_all("outputs").unwrap();
+            if let Err(e) = fs::create_dir_all("outputs") {
+                return format!("Failed to create outputs directory: {}", e);
+            }
 
-            fs::write(&path, content).unwrap();
-
-            println!("Saved file: {}", path.bright_green());
+            match fs::write(&path, content) {
+                Ok(_) => format!("Saved file: {}", path),
+                Err(e) => format!("Failed to save file {}: {}", path, e),
+            }
         }
 
-        _ => {
-            println!("{}", "Unknown tool.".bright_red());
+        "open_chrome" => open_app("chrome", tool_call.args.url),
+
+        "open_app" => {
+            let Some(app) = tool_call.args.app else {
+                return "Missing app for open_app".to_string();
+            };
+
+            open_app(&app, tool_call.args.url)
         }
+
+        "run_safe_command" => {
+            let Some(command) = tool_call.args.command else {
+                return "Missing command for run_safe_command".to_string();
+            };
+
+            run_safe_command(&command)
+        }
+
+        _ => format!("Unknown tool: {}", tool_call.tool),
     }
-    return format!("Saved file: {}", path);
-    return "Blocked unsafe path".to_string();
 }
 fn credits() {
     println!("\n{}", "━".repeat(60).bright_black());
@@ -287,9 +398,11 @@ async fn main() {
         content: r#"
     You are TRUST.
 
-    You may use tools by replying ONLY with JSON.
+    You are a helpful terminal AI with subtle, safe agentic control.
+    You can answer normally, or use tools when the user asks you to do something supported.
+    When using a tool, reply ONLY with JSON and no extra text.
 
-    Example:
+    Example write_file tool call:
 
     {
       "type": "tool_call",
@@ -300,11 +413,51 @@ async fn main() {
       }
     }
 
-    Allowed tools:
-    - write_file
+    Example open_app tool call:
 
-    Never pretend to save files.
-    Only use JSON when calling tools.
+    {
+      "type": "tool_call",
+      "tool": "open_app",
+      "args": {
+        "app": "chrome"
+      }
+    }
+
+    Example open_app with URL:
+
+    {
+      "type": "tool_call",
+      "tool": "open_app",
+      "args": {
+        "app": "chrome",
+        "url": "https://www.google.com"
+      }
+    }
+
+    Example safe command:
+
+    {
+      "type": "tool_call",
+      "tool": "run_safe_command",
+      "args": {
+        "command": "date"
+      }
+    }
+
+    Allowed tools:
+    - write_file: only writes inside outputs/
+    - open_app: opens allowed apps only. Allowed apps: chrome, edge, firefox, notepad, calculator, explorer, paint, wordpad, vscode
+    - open_chrome: alias for opening Chrome
+    - run_safe_command: runs allowlisted read-only commands only. Allowed commands: date, time, whoami, hostname, ver, list_outputs, list_memory
+
+    Safety rules:
+    - Do not claim you cannot interact with the computer when an allowed tool can do the task.
+    - Do not perform destructive actions.
+    - Do not delete files, modify system settings, run arbitrary shell commands, install software, download files, or access private data.
+    - If the user asks for an unsupported or destructive command, explain that it is blocked for safety and offer a safe alternative.
+    - Never pretend to save files, open apps, or run commands. Use a tool when available.
+    - Only use JSON when calling tools.
+    
     "#
         .to_string(),
     });
@@ -331,6 +484,11 @@ async fn main() {
 
         if input == "/list" {
             list_chats();
+            continue;
+        }
+
+        if input == "/credits" {
+            credits();
             continue;
         }
 
@@ -399,6 +557,6 @@ fn intro() {
 
     println!(
         "{}",
-        "Commands: /list, /chat <name>, /delete <name>, /clear, /exit\n".bright_red()
+        "Commands: /list, /chat <name>, /delete <name>, /credits, /clear, /exit\n".bright_red()
     );
 }
