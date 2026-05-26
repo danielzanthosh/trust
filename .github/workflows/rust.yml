@@ -1,4 +1,4 @@
-```yml
+yml
 name: Rust CI 🚀
 
 on:
@@ -39,4 +39,3 @@ jobs:
 
     - name: Finished Successfully
       run: echo "Rust project built successfully 🚀"
-```
