@@ -142,11 +142,8 @@ fn list_chats() {
 
             for entry in entries {
                 let entry = entry.unwrap();
-
                 let file_name = entry.file_name();
-
                 let file_name = file_name.to_string_lossy();
-
                 let chat_name = file_name.replace(".json", "");
 
                 println!("- {}", chat_name.bright_cyan());
