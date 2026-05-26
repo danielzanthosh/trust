@@ -39,6 +39,10 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
     let base_url = env::var("BASE_URL").unwrap_or_default();
     let model = env::var("MODEL").unwrap_or_default();
 
+    if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&full_message) {
+        run_tool(tool_call);
+    }
+
     history.push(Message {
         role: "user".to_string(),
         content: input.to_string(),
