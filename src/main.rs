@@ -30,7 +30,7 @@ async fn main() {
         "Please check the README for instructions.".bright_black()
     );
 
-    let current_chat = "default".to_string();
+    let mut current_chat = "default".to_string();
     let mut history: Vec<Message> = load_history(&current_chat);
 
     loop {
@@ -51,6 +51,19 @@ async fn main() {
             history = Vec::new();
 
             println!("Started new chat: {}", current_chat.bright_cyan());
+        } else if input.starts_with("/loadchat ") {
+            let name = input.replace("/loadchat ", "").trim().to_string();
+
+            current_chat = name.clone();
+            history = load_history(&current_chat);
+
+            println!(
+                "Loaded chat: {} ({} messages)",
+                current_chat.bright_cyan(),
+                history.len()
+            );
+        } else if input == "/listchats" {
+            list_chats();
         } else {
             handle_input(input, &current_chat, &mut history).await;
         }
@@ -136,6 +149,33 @@ fn load_history(chat_name: &str) -> Vec<Message> {
     }
 }
 
+fn list_chats() {
+    let paths = fs::read_dir("memory");
+
+    match paths {
+        Ok(entries) => {
+            println!("\nSaved Chats:\n");
+
+            for entry in entries {
+                let entry = entry.unwrap();
+
+                let file_name = entry.file_name();
+
+                let file_name = file_name.to_string_lossy();
+
+                let chat_name = file_name.replace(".json", "");
+
+                println!("- {}", chat_name.bright_cyan());
+            }
+
+            println!();
+        }
+
+        Err(_) => {
+            println!("No chats found.");
+        }
+    }
+}
 fn credits() {
     println!("\n{}", "━".repeat(60).bright_black());
     println!("🤖 {}", "Terminal AI Assistant".bold().bright_cyan());
