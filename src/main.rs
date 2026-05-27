@@ -1,9 +1,25 @@
-// AI Assistant through the Terminal
-// OpenAI, Anthropic API Compatible
-// Custom Base URL, and API Key
-// Works with Hackclub AI
-// Fast, Secure, Memory Safety
-// Features: Chat History, Infinite Memory
+// TRUST
+// Terminal Runtime for Unified Smart Tasks
+//
+// A sandboxed terminal AI runtime written in Rust.
+//
+// Features:
+// - Multi-provider AI support
+// - Streaming chat responses
+// - Persistent multi-chat memory
+// - Autonomous agent loop
+// - Structired tool caling
+// - Sandboxed file system access
+// - Safe command execution
+// - OpenAI & Anthropic compatibility
+//
+// Providers:
+// Openrouter • Groq • NVIDIA • Cerebras • Anthropic • HCAI
+//
+// Designed for speed, safety, and controlled autonomy.
+//
+// Build with Rust by Daniel Santhosh
+// GitHub Repo: https://github.com/danielzanthosh/trust
 
 use colored::*;
 use dotenvy::dotenv;
