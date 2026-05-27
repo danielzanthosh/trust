@@ -551,7 +551,11 @@ async fn handle_input(
                 content: format!("Tool result from TRUST runtime: {}", tool_result),
             });
 
-            if step + 1 < MAX_AGENT_STEPS {
+            if step + 1 == MAX_AGENT_STEPS {
+                println!(
+                    "{}",
+                    "Stopped after reaching max autonomous tool steps.".bright_yellow()
+                );
                 continue;
             }
 
