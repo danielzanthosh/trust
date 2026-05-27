@@ -457,7 +457,7 @@ async fn main() {
     - If the user asks for an unsupported or destructive command, explain that it is blocked for safety and offer a safe alternative.
     - Never pretend to save files, open apps, or run commands. Use a tool when available.
     - Only use JSON when calling tools.
-    
+
     "#
         .to_string(),
     });
