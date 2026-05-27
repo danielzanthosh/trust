@@ -9,6 +9,7 @@ use colored::*;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
@@ -38,6 +39,118 @@ struct ToolArgs {
     command: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provider {
+    OpenAiCompatible,
+    AnthropicCompatible,
+}
+
+fn detect_provider(base_url: &str) -> Provider {
+    let normalized = base_url.trim().to_lowercase();
+
+    if normalized.contains("anthropic") || normalized.ends_with("/v1/messages") {
+        Provider::AnthropicCompatible
+    } else {
+        Provider::OpenAiCompatible
+    }
+}
+
+fn build_request_url(base_url: &str, provider: Provider) -> String {
+    let normalized = base_url.trim().trim_end_matches('/');
+
+    if normalized.ends_with("/v1/chat/completions")
+        || normalized.ends_with("/chat/completions")
+        || normalized.ends_with("/v1/messages")
+    {
+        normalized.to_string()
+    } else {
+        match provider {
+            Provider::OpenAiCompatible => format!("{}/v1/chat/completions", normalized),
+            Provider::AnthropicCompatible => format!("{}/v1/messages", normalized),
+        }
+    }
+}
+
+fn build_headers(api_key: &str, provider: Provider) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+    match provider {
+        Provider::OpenAiCompatible => {
+            let value = format!("Bearer {}", api_key);
+            let header = HeaderValue::from_str(&value)
+                .map_err(|e| format!("Invalid API key for Authorization header: {}", e))?;
+            headers.insert(AUTHORIZATION, header);
+        }
+        Provider::AnthropicCompatible => {
+            let api_key_header = HeaderValue::from_str(api_key)
+                .map_err(|e| format!("Invalid API key for x-api-key header: {}", e))?;
+            headers.insert("x-api-key", api_key_header);
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        }
+    }
+
+    Ok(headers)
+}
+
+fn build_request_body(model: &str, history: &[Message], provider: Provider) -> serde_json::Value {
+    match provider {
+        Provider::OpenAiCompatible => json!({
+            "model": model,
+            "messages": history,
+            "stream": true
+        }),
+        Provider::AnthropicCompatible => {
+            let system = history
+                .iter()
+                .filter(|message| message.role == "system")
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            let messages = history
+                .iter()
+                .filter(|message| message.role != "system")
+                .map(|message| {
+                    let role = match message.role.as_str() {
+                        "assistant" => "assistant",
+                        "user" => "user",
+                        "tool" => "assistant",
+                        _ => "user",
+                    };
+
+                    json!({
+                        "role": role,
+                        "content": message.content,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            json!({
+                "model": model,
+                "system": system,
+                "messages": messages,
+                "stream": true,
+                "max_tokens": 4096
+            })
+        }
+    }
+}
+
+fn extract_stream_text(data: &str) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(data).unwrap_or_default();
+
+    if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
+        return content.to_string();
+    }
+
+    if let Some(content) = parsed["delta"]["text"].as_str() {
+        return content.to_string();
+    }
+
+    String::new()
+}
+
 async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message>) {
     let api_key = env::var("API_KEY").unwrap_or_default();
     let base_url = env::var("BASE_URL").unwrap_or_default();
@@ -57,14 +170,8 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
         eprintln!("Missing MODEL. Example: MODEL=gpt-4o-mini");
         return;
     }
-
-    let base_url = base_url.trim().trim_end_matches('/');
-    let url =
-        if base_url.ends_with("/v1/chat/completions") || base_url.ends_with("/chat/completions") {
-            base_url.to_string()
-        } else {
-            format!("{}/v1/chat/completions", base_url)
-        };
+    let provider = detect_provider(&base_url);
+    let url = build_request_url(&base_url, provider);
 
     history.push(Message {
         role: "user".to_string(),
@@ -72,26 +179,31 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
     });
 
     let client = Client::new();
+    let body = build_request_body(&model, history, provider);
 
-    let body = json!({
-        "model": model,
-        "messages": history,
-        "stream": true
-    });
+    let headers = match build_headers(&api_key, provider) {
+        Ok(headers) => headers,
+        Err(error) => {
+            eprintln!("Header Error: {}", error);
+            return;
+        }
+    };
 
-    let response = client
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await;
+    let response = client.post(&url).headers(headers).json(&body).send().await;
 
     match response {
         Ok(res) => {
             let status = res.status();
 
             if !status.is_success() {
+                let error_body = res
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<failed to read error response body>".to_string());
                 println!("API Error Status: {}", status);
+                println!("API Error Body: {}", error_body);
+                println!("Request URL: {}", url);
+                println!("Detected Provider: {:?}", provider);
                 return;
             }
 
@@ -112,18 +224,13 @@ async fn handle_input(input: &str, current_chat: &str, history: &mut Vec<Message
                                     break;
                                 }
 
-                                let parsed: serde_json::Value =
-                                    serde_json::from_str(&data).unwrap_or_default();
-
-                                let content = parsed["choices"][0]["delta"]["content"]
-                                    .as_str()
-                                    .unwrap_or("");
+                                let content = extract_stream_text(&data);
 
                                 print!("{}", content.bright_green());
 
                                 io::stdout().flush().unwrap();
 
-                                full_message.push_str(content);
+                                full_message.push_str(&content);
                             }
                         }
                     }
