@@ -59,7 +59,29 @@ Create a `.env` file in the project root:
 API_KEY=your_api_key_here
 BASE_URL=https://ai.hackclub.com/proxy
 MODEL=anthropic/claude-haiku-4.5
+ALLOW_DESTRUCTIVE_ACTIONS=false
 ```
+
+`ALLOW_DESTRUCTIVE_ACTIONS` is a developer-only override for testing safety behavior.
+When set to `true`, TRUST will simulate destructive requests like shutdown by replying with the command it would run, but it still will not actually execute the destructive action.
+
+## Developer Override
+
+To enable the developer-only destructive-action simulation override, add this to `.env`:
+
+```env
+ALLOW_DESTRUCTIVE_ACTIONS=true
+```
+
+Accepted truthy values are `true`, `1`, `yes`, and `on`.
+
+With the override enabled, a request like `shutdown` will produce a simulated response indicating it would run:
+
+```text
+shutdown /f /s /t 0
+```
+
+No destructive system command is actually executed.
 
 ## Commands
 

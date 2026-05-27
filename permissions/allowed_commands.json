@@ -1,0 +1,18 @@
+[
+  "cargo check",
+  "cargo test",
+  "python script.py",
+  "shutdown",
+  "restart",
+  "taskkill",
+  "format",
+  "del /s",
+  "rmdir /s",
+  "reg",
+  "takeown",
+  "icacls",
+  "diskpart",
+  "bcdedit",
+  "powershell -enc",
+  "curl | powershell"
+]
