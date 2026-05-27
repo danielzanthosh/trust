@@ -62,26 +62,28 @@ MODEL=anthropic/claude-haiku-4.5
 ALLOW_DESTRUCTIVE_ACTIONS=false
 ```
 
-`ALLOW_DESTRUCTIVE_ACTIONS` is a developer-only override for testing safety behavior.
-When set to `true`, TRUST will simulate destructive requests like shutdown by replying with the command it would run, but it still will not actually execute the destructive action.
+`ALLOW_DESTRUCTIVE_ACTIONS` controls whether destructive commands requested through `run_command` are always blocked or may be presented for explicit approval.
+When set to `false`, destructive commands are blocked.
+When set to `true`, destructive commands still never auto-run: the runtime will prompt the user and only execute them when the user chooses `Allow once`.
 
-## Developer Override
+## Command Permissions
 
-To enable the developer-only destructive-action simulation override, add this to `.env`:
+TRUST supports runtime-gated command execution through the `run_command` tool.
+
+- Commands run inside `sandbox/workspace`
+- `stdin` is disabled
+- `stdout` and `stderr` are captured
+- the timeout comes from `SANDBOX_COMMAND_TIMEOUT_MS`
+- destructive commands are never persisted to `permissions/allowed_commands.json`
+- non-destructive commands may be saved with `Allow always`
+
+To enable destructive command approvals, add this to `.env`:
 
 ```env
 ALLOW_DESTRUCTIVE_ACTIONS=true
 ```
 
 Accepted truthy values are `true`, `1`, `yes`, and `on`.
-
-With the override enabled, a request like `shutdown` will produce a simulated response indicating it would run:
-
-```text
-shutdown /f /s /t 0
-```
-
-No destructive system command is actually executed.
 
 ## Commands
 
