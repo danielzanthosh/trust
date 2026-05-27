@@ -1,4 +1,4 @@
 /target
 .env
 .json
-memory/default.json
+memory/*.json
