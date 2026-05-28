@@ -24,6 +24,7 @@
 use colored::*;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
+use ratatui::prelude::*;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
