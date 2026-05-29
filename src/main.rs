@@ -1252,10 +1252,10 @@ async fn run_tool(
                 Err(error) => return error,
             };
 
-            if let Some(parent) = resolved_path.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    return format!("Failed to create parent directory for {}: {}", path, e);
-                }
+            if let Some(parent) = resolved_path.parent()
+                && let Err(e) = fs::create_dir_all(parent)
+            {
+                return format!("Failed to create parent directory for {}: {}", path, e);
             }
 
             let content = tool_call.args.content.unwrap_or_default();
@@ -1916,8 +1916,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tui = Tui::new()?;
     let mut app = App::new(sandbox);
-    app.status =
-        format!("Ready · /chat <name> · /list · /clear · /delete <name> · /credits · Ctrl+C quit");
+    app.status = "Ready · /chat <name> · /list · /clear · /delete <name> · /credits · Ctrl+C quit"
+        .to_string();
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
 
@@ -1928,10 +1928,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tui.draw(&app)?;
 
-        if event::poll(Duration::from_millis(50))? {
-            if let CEvent::Key(key) = event::read()? {
-                handle_key_event(&mut app, key, &event_tx);
-            }
+        if event::poll(Duration::from_millis(50))?
+            && let CEvent::Key(key) = event::read()?
+        {
+            handle_key_event(&mut app, key, &event_tx);
         }
     }
 
