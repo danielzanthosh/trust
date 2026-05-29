@@ -1,29 +1,25 @@
 // TRUST
 // Terminal Runtime for Unified Smart Tasks
-//
-// A sandboxed terminal AI runtime written in Rust.
-//
-// Features:
-// - Multi-provider AI support
-// - Streaming chat responses
-// - Persistent multi-chat memory
-// - Autonomous agent loop
-// - Structired tool caling
-// - Sandboxed file system access
-// - Safe command execution
-// - OpenAI & Anthropic compatibility
-//
-// Providers:
-// Openrouter • Groq • NVIDIA • Cerebras • Anthropic • HCAI
-//
-// Designed for speed, safety, and controlled autonomy.
-//
-// Build with Rust by Daniel Santhosh
-// GitHub Repo: https://github.com/danielzanthosh/trust
+// Sandboxed terminal AI runtime with a ratatui/crossterm TUI, streaming chat, tool execution, and permission-gated command execution.
 
-use colored::*;
+use crossterm::{
+    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
 use dotenvy::dotenv;
 use futures_util::StreamExt;
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
+};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -31,15 +27,19 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Stdout};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
 
 const MAX_AGENT_STEPS: usize = 5;
 const DEFAULT_SANDBOX_DIR: &str = "sandbox/workspace";
 const DEFAULT_SANDBOX_COMMAND_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_TOKENS: u64 = 1024;
+const TOOL_RESULT_PREFIX: &str = "Tool result from TRUST runtime: ";
+const WEBBRIDGE_COMMAND_URL: &str = "http://127.0.0.1:10086/command";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Message {
@@ -61,6 +61,11 @@ struct ToolArgs {
     url: Option<String>,
     app: Option<String>,
     command: Option<String>,
+    action: Option<String>,
+    selector: Option<String>,
+    value: Option<String>,
+    session: Option<String>,
+    new_tab: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +136,174 @@ enum PermissionChoice {
     AllowOnce,
     AllowAlways,
     Decline,
+}
+
+#[derive(Clone, Debug)]
+enum UiMessageRole {
+    User,
+    Assistant,
+    Tool,
+    Info,
+}
+
+#[derive(Clone, Debug)]
+struct UiMessage {
+    role: UiMessageRole,
+    content: String,
+}
+
+struct PendingApproval {
+    title: String,
+    command: String,
+    risk_label: String,
+    allow_always: bool,
+    responder: oneshot::Sender<PermissionChoice>,
+}
+
+enum RuntimeEvent {
+    Status(String),
+    StartAssistant,
+    AssistantChunk(String),
+    CommitAssistant(String),
+    DiscardAssistantDraft,
+    ToolResult(String),
+    ApprovalRequested(PendingApproval),
+    TurnFinished(Vec<Message>),
+    Error(String),
+}
+
+struct App {
+    current_chat: String,
+    model_history: Vec<Message>,
+    visible_messages: Vec<UiMessage>,
+    input: String,
+    draft_assistant: String,
+    status: String,
+    transcript_scroll: u16,
+    auto_scroll: bool,
+    should_quit: bool,
+    busy: bool,
+    pending_approval: Option<PendingApproval>,
+    sandbox: SandboxConfig,
+}
+
+impl App {
+    fn new(sandbox: SandboxConfig) -> Self {
+        let current_chat = "default".to_string();
+        let model_history = ensure_system_message(load_history(&current_chat));
+        let visible_messages = ui_messages_from_history(&model_history);
+
+        Self {
+            current_chat,
+            model_history,
+            visible_messages,
+            input: String::new(),
+            draft_assistant: String::new(),
+            status: "Ready".to_string(),
+            transcript_scroll: u16::MAX,
+            auto_scroll: true,
+            should_quit: false,
+            busy: false,
+            pending_approval: None,
+            sandbox,
+        }
+    }
+
+    fn set_chat(&mut self, chat_name: String) {
+        self.current_chat = chat_name;
+        self.model_history = ensure_system_message(load_history(&self.current_chat));
+        self.visible_messages = ui_messages_from_history(&self.model_history);
+        self.draft_assistant.clear();
+        self.pending_approval = None;
+        self.busy = false;
+        self.status = format!("Switched to chat: {}", self.current_chat);
+        self.scroll_to_bottom();
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.transcript_scroll = u16::MAX;
+        self.auto_scroll = true;
+    }
+
+    fn scroll_up(&mut self, amount: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(amount);
+        self.auto_scroll = false;
+    }
+
+    fn scroll_down(&mut self, amount: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_add(amount);
+        if self.transcript_scroll == u16::MAX {
+            self.auto_scroll = true;
+        }
+    }
+
+    fn push_visible_message(&mut self, role: UiMessageRole, content: String) {
+        if content.trim().is_empty() {
+            return;
+        }
+
+        self.visible_messages.push(UiMessage { role, content });
+        if self.auto_scroll {
+            self.scroll_to_bottom();
+        }
+    }
+
+    fn add_info_message(&mut self, content: impl Into<String>) {
+        self.push_visible_message(UiMessageRole::Info, content.into());
+    }
+
+    fn add_user_message(&mut self, content: String) {
+        self.push_visible_message(UiMessageRole::User, content);
+    }
+
+    fn add_tool_message(&mut self, content: String) {
+        self.push_visible_message(UiMessageRole::Tool, content);
+    }
+
+    fn add_assistant_message(&mut self, content: String) {
+        self.push_visible_message(UiMessageRole::Assistant, content);
+    }
+
+    fn handle_runtime_event(&mut self, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::Status(status) => self.status = status,
+            RuntimeEvent::StartAssistant => {
+                self.draft_assistant.clear();
+                self.busy = true;
+            }
+            RuntimeEvent::AssistantChunk(chunk) => {
+                self.draft_assistant.push_str(&chunk);
+                if self.auto_scroll {
+                    self.scroll_to_bottom();
+                }
+            }
+            RuntimeEvent::CommitAssistant(message) => {
+                self.draft_assistant.clear();
+                self.add_assistant_message(message);
+            }
+            RuntimeEvent::DiscardAssistantDraft => self.draft_assistant.clear(),
+            RuntimeEvent::ToolResult(result) => self.add_tool_message(result),
+            RuntimeEvent::ApprovalRequested(pending) => {
+                self.status = format!("Approval required for command: {}", pending.command);
+                self.pending_approval = Some(pending);
+            }
+            RuntimeEvent::TurnFinished(history) => {
+                self.model_history = history;
+                self.busy = false;
+                self.pending_approval = None;
+                self.draft_assistant.clear();
+                save_history(&self.current_chat, &self.model_history);
+                self.status = format!("Ready · chat: {}", self.current_chat);
+            }
+            RuntimeEvent::Error(error) => {
+                self.draft_assistant.clear();
+                self.busy = false;
+                self.pending_approval = None;
+                self.status = error.clone();
+                self.add_info_message(error);
+            }
+        }
+    }
 }
 
 fn absolute_path_from(base: &Path, path: &str) -> PathBuf {
@@ -336,64 +509,6 @@ fn ensure_sandbox_ready(config: &SandboxConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn read_approval_input(prompt: &str) -> bool {
-    print!("{}", prompt.bright_yellow());
-    io::stdout().flush().unwrap();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return false;
-    }
-
-    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
-}
-
-fn read_permission_choice(command: &str, risk: CommandRisk) -> PermissionChoice {
-    match risk {
-        CommandRisk::NeedsApproval => {
-            println!(
-                "\n{} {}",
-                "Command requested:".bright_yellow().bold(),
-                command
-            );
-            println!("{} {}", "Risk:".bright_yellow().bold(), "NeedsApproval");
-            println!("\nOptions:");
-            println!("[A] Allow once");
-            println!("[L] Allow always");
-            println!("[D] Decline");
-            print!("{}", "Choose A, L, or D: ".bright_yellow());
-        }
-        CommandRisk::Destructive => {
-            println!(
-                "\n{} {}",
-                "Destructive command requested:".bright_red().bold(),
-                command
-            );
-            println!("{} {}", "Risk:".bright_red().bold(), "Destructive");
-            println!("\nOptions:");
-            println!("[A] Allow once");
-            println!("[D] Decline");
-            print!("{}", "Choose A or D: ".bright_yellow());
-        }
-        _ => return PermissionChoice::Decline,
-    }
-
-    io::stdout().flush().unwrap();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return PermissionChoice::Decline;
-    }
-
-    match (risk, input.trim().to_lowercase().as_str()) {
-        (_, "a") | (_, "allow once") => PermissionChoice::AllowOnce,
-        (CommandRisk::NeedsApproval, "l") | (CommandRisk::NeedsApproval, "allow always") => {
-            PermissionChoice::AllowAlways
-        }
-        _ => PermissionChoice::Decline,
-    }
-}
-
 fn permissions_dir() -> PathBuf {
     env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -534,25 +649,6 @@ fn destructive_command_reason(command: &str, project_root: &Path) -> Option<Stri
     None
 }
 
-fn response_claims_destructive_action(response: &str) -> bool {
-    let normalized = response.trim().to_lowercase();
-
-    let dangerous_claims = [
-        "shutting down",
-        "shutting the pc down",
-        "powering off",
-        "restarting now",
-        "rebooting now",
-        "formatting",
-        "wiping",
-        "deleting system32",
-    ];
-
-    dangerous_claims
-        .iter()
-        .any(|claim| normalized.contains(claim))
-}
-
 fn blocked_command_reason(command: &str) -> Option<String> {
     if command.trim().is_empty() {
         Some("empty command".to_string())
@@ -600,7 +696,8 @@ fn execute_command_with_timeout(
     let cargo_target_dir = sandbox.temp.join("target");
     if let Err(e) = fs::create_dir_all(&cargo_target_dir) {
         return format!(
-            "Failed to prepare sandbox target directory {}: {}",
+            "Command failed: {}\n[stderr]\nFailed to prepare sandbox target directory {}: {}",
+            display_name,
             display_path(&cargo_target_dir),
             e
         );
@@ -616,7 +713,7 @@ fn execute_command_with_timeout(
         .spawn()
     {
         Ok(child) => child,
-        Err(e) => return format!("Failed to start command {}: {}", display_name, e),
+        Err(e) => return format!("Command failed: {}\n[stderr]\n{}", display_name, e),
     };
 
     let start = Instant::now();
@@ -654,7 +751,10 @@ fn execute_command_with_timeout(
                             )
                         }
                     }
-                    Err(e) => format!("Failed to collect output from {}: {}", display_name, e),
+                    Err(e) => format!(
+                        "Command failed: {}\n[stderr]\nFailed to collect output: {}",
+                        display_name, e
+                    ),
                 };
             }
             Ok(None) => {
@@ -669,12 +769,47 @@ fn execute_command_with_timeout(
 
                 thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => return format!("Failed while waiting on command {}: {}", display_name, e),
+            Err(e) => {
+                return format!(
+                    "Command failed: {}\n[stderr]\nFailed while waiting on command: {}",
+                    display_name, e
+                );
+            }
         }
     }
 }
 
-fn run_command(sandbox: &SandboxConfig, command: &str) -> String {
+async fn request_permission(
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    title: &str,
+    command: &str,
+    risk_label: &str,
+    allow_always: bool,
+) -> PermissionChoice {
+    let (response_tx, response_rx) = oneshot::channel();
+    let pending = PendingApproval {
+        title: title.to_string(),
+        command: command.to_string(),
+        risk_label: risk_label.to_string(),
+        allow_always,
+        responder: response_tx,
+    };
+
+    if event_tx
+        .send(RuntimeEvent::ApprovalRequested(pending))
+        .is_err()
+    {
+        return PermissionChoice::Decline;
+    }
+
+    response_rx.await.unwrap_or(PermissionChoice::Decline)
+}
+
+async fn run_command(
+    sandbox: &SandboxConfig,
+    command: &str,
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+) -> String {
     let normalized = normalize_command(command);
     if normalized.is_empty() {
         return "Blocked command: empty command".to_string();
@@ -695,7 +830,16 @@ fn run_command(sandbox: &SandboxConfig, command: &str) -> String {
             execute_command_with_timeout(sandbox, "cmd", &["/C", normalized.as_str()], &normalized)
         }
         Ok(CommandRisk::NeedsApproval) => {
-            match read_permission_choice(&normalized, CommandRisk::NeedsApproval) {
+            let choice = request_permission(
+                event_tx,
+                "Command requested",
+                &normalized,
+                "NeedsApproval",
+                true,
+            )
+            .await;
+
+            match choice {
                 PermissionChoice::AllowOnce => execute_command_with_timeout(
                     sandbox,
                     "cmd",
@@ -726,7 +870,16 @@ fn run_command(sandbox: &SandboxConfig, command: &str) -> String {
                 return format!("Blocked destructive command: {} ({})", normalized, reason);
             }
 
-            match read_permission_choice(&normalized, CommandRisk::Destructive) {
+            let choice = request_permission(
+                event_tx,
+                "Destructive command requested",
+                &normalized,
+                "Destructive",
+                false,
+            )
+            .await;
+
+            match choice {
                 PermissionChoice::AllowOnce => execute_command_with_timeout(
                     sandbox,
                     "cmd",
@@ -793,12 +946,23 @@ fn build_headers(api_key: &str, provider: Provider) -> Result<HeaderMap, String>
     Ok(headers)
 }
 
+fn max_tokens() -> u64 {
+    env::var("MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
 fn build_request_body(model: &str, history: &[Message], provider: Provider) -> serde_json::Value {
+    let max_tokens = max_tokens();
+
     match provider {
         Provider::OpenAiCompatible => json!({
             "model": model,
             "messages": history,
-            "stream": true
+            "stream": true,
+            "max_tokens": max_tokens
         }),
         Provider::AnthropicCompatible => {
             let system = history
@@ -814,8 +978,6 @@ fn build_request_body(model: &str, history: &[Message], provider: Provider) -> s
                 .map(|message| {
                     let role = match message.role.as_str() {
                         "assistant" => "assistant",
-                        "user" => "user",
-                        "tool" => "assistant",
                         _ => "user",
                     };
 
@@ -831,7 +993,7 @@ fn build_request_body(model: &str, history: &[Message], provider: Provider) -> s
                 "system": system,
                 "messages": messages,
                 "stream": true,
-                "max_tokens": 4096
+                "max_tokens": max_tokens
             })
         }
     }
@@ -851,38 +1013,33 @@ fn extract_stream_text(data: &str) -> String {
     String::new()
 }
 
-async fn request_model_reply(history: &[Message]) -> Result<String, ()> {
+async fn request_model_reply(
+    history: &[Message],
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+) -> Result<String, String> {
     let api_key = env::var("API_KEY").unwrap_or_default();
     let base_url = env::var("BASE_URL").unwrap_or_default();
     let model = env::var("MODEL").unwrap_or_default();
 
     if api_key.trim().is_empty() {
-        eprintln!("Missing API_KEY. Add it to your .env file or environment variables.");
-        return Err(());
+        return Err(
+            "Missing API_KEY. Add it to your .env file or environment variables.".to_string(),
+        );
     }
 
     if base_url.trim().is_empty() {
-        eprintln!("Missing BASE_URL. Example: BASE_URL=https://api.openai.com");
-        return Err(());
+        return Err("Missing BASE_URL. Example: BASE_URL=https://api.openai.com".to_string());
     }
 
     if model.trim().is_empty() {
-        eprintln!("Missing MODEL. Example: MODEL=gpt-4o-mini");
-        return Err(());
+        return Err("Missing MODEL. Example: MODEL=gpt-4o-mini".to_string());
     }
 
     let provider = detect_provider(&base_url);
     let url = build_request_url(&base_url, provider);
     let client = Client::new();
     let body = build_request_body(&model, history, provider);
-
-    let headers = match build_headers(&api_key, provider) {
-        Ok(headers) => headers,
-        Err(error) => {
-            eprintln!("Header Error: {}", error);
-            return Err(());
-        }
-    };
+    let headers = build_headers(&api_key, provider)?;
 
     let response = client.post(&url).headers(headers).json(&body).send().await;
 
@@ -895,15 +1052,15 @@ async fn request_model_reply(history: &[Message]) -> Result<String, ()> {
                     .text()
                     .await
                     .unwrap_or_else(|_| "<failed to read error response body>".to_string());
-                println!("API Error Status: {}", status);
-                println!("API Error Body: {}", error_body);
-                println!("Request URL: {}", url);
-                println!("Detected Provider: {:?}", provider);
-                return Err(());
+                return Err(format!(
+                    "API error status: {}\n\nAPI error body:\n{}\n\nRequest URL:\n{}\n\nDetected provider: {:?}",
+                    status, error_body, url, provider
+                ));
             }
 
             let mut stream = res.bytes_stream();
             let mut full_message = String::new();
+            let _ = event_tx.send(RuntimeEvent::StartAssistant);
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -919,169 +1076,278 @@ async fn request_model_reply(history: &[Message]) -> Result<String, ()> {
                                 }
 
                                 let content = extract_stream_text(&data);
-
-                                print!("{}", content.bright_green());
-                                io::stdout().flush().unwrap();
-                                full_message.push_str(&content);
+                                if !content.is_empty() {
+                                    full_message.push_str(&content);
+                                    let _ = event_tx.send(RuntimeEvent::AssistantChunk(content));
+                                }
                             }
                         }
                     }
-                    Err(e) => {
-                        println!("Stream Error: {}", e);
+                    Err(error) => {
+                        return Err(format!("Stream error: {}", error));
                     }
                 }
             }
 
-            println!();
             Ok(full_message)
         }
-        Err(e) => {
-            eprintln!("Request Error: {}", e);
-            if e.is_builder() {
-                eprintln!(
-                    "This usually means BASE_URL is not a valid absolute URL. Current request URL: {}",
-                    url
-                );
+        Err(error) => {
+            if error.is_builder() {
+                Err(format!(
+                    "Request error: {}\nThis usually means BASE_URL is not a valid absolute URL. Current request URL: {}",
+                    error, url
+                ))
+            } else {
+                Err(format!("Request error: {}", error))
             }
-            Err(())
         }
     }
 }
 
-async fn handle_input(
-    input: &str,
-    current_chat: &str,
-    history: &mut Vec<Message>,
-    sandbox: &SandboxConfig,
-) {
-    history.push(Message {
-        role: "user".to_string(),
-        content: input.to_string(),
+fn response_claims_destructive_action(response: &str) -> bool {
+    let normalized = response.trim().to_lowercase();
+
+    let dangerous_claims = [
+        "shutting down",
+        "shutting the pc down",
+        "powering off",
+        "restarting now",
+        "rebooting now",
+        "formatting",
+        "wiping",
+        "deleting system32",
+    ];
+
+    dangerous_claims
+        .iter()
+        .any(|claim| normalized.contains(claim))
+}
+
+fn allowed_sandbox_command(command: &str) -> Option<AllowedCommand> {
+    let normalized = command.trim().to_lowercase();
+
+    match normalized.as_str() {
+        "cargo check" => Some(AllowedCommand {
+            display: "cargo check",
+            program: "cargo",
+            args: &["check"],
+        }),
+
+        "cargo fmt --check" => Some(AllowedCommand {
+            display: "cargo fmt --check",
+            program: "cargo",
+            args: &["fmt", "--check"],
+        }),
+        "cargo clippy" => Some(AllowedCommand {
+            display: "cargo clippy",
+            program: "cargo",
+            args: &["clippy"],
+        }),
+        _ => None,
+    }
+}
+
+async fn run_sandboxed_command(
+    config: &SandboxConfig,
+    command: &str,
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+) -> String {
+    let Some(allowed_command) = allowed_sandbox_command(command) else {
+        return format!(
+            "Blocked command: {}. Allowed sandbox commands: cargo check, cargo fmt --check, cargo clippy",
+            command
+        );
+    };
+
+    let choice = request_permission(
+        event_tx,
+        "Sandboxed command requested",
+        allowed_command.display,
+        "NeedsApproval",
+        false,
+    )
+    .await;
+
+    match choice {
+        PermissionChoice::AllowOnce => execute_command_with_timeout(
+            config,
+            allowed_command.program,
+            allowed_command.args,
+            allowed_command.display,
+        ),
+        PermissionChoice::AllowAlways | PermissionChoice::Decline => {
+            format!("User declined command: {}", allowed_command.display)
+        }
+    }
+}
+
+fn webbridge_unavailable_message(error: &str) -> String {
+    format!(
+        "Kimi WebBridge is not available or not connected. Install the Kimi WebBridge browser extension, install/start the device daemon, then retry. Check it with `~/.kimi-webbridge/bin/kimi-webbridge status`. Details: {}",
+        error
+    )
+}
+
+async fn send_webbridge_command(
+    action: &str,
+    args: serde_json::Value,
+    session: Option<String>,
+) -> String {
+    let client = Client::new();
+    let mut body = json!({
+        "action": action,
+        "args": args,
     });
 
-    for step in 0..MAX_AGENT_STEPS {
-        let full_message = match request_model_reply(history).await {
-            Ok(message) => message,
-            Err(()) => return,
-        };
+    if let Some(session) = session.filter(|session| !session.trim().is_empty()) {
+        body["session"] = json!(session);
+    }
 
-        if response_claims_destructive_action(&full_message) {
-            let response = "Blocked destructive command: assistant claimed execution without a runtime tool result".to_string();
-            println!("{}", response.bright_green());
+    let response = client.post(WEBBRIDGE_COMMAND_URL).json(&body).send().await;
 
-            history.push(Message {
-                role: "assistant".to_string(),
-                content: response,
-            });
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return webbridge_unavailable_message(&error.to_string()),
+    };
 
-            save_history(current_chat, history);
-            return;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read WebBridge response>".to_string());
+
+    if !status.is_success() {
+        return webbridge_unavailable_message(&format!("HTTP {}: {}", status, text));
+    }
+
+    format!("Kimi WebBridge {} result:\n{}", action, text)
+}
+
+fn webbridge_unavailable(result: &str) -> bool {
+    result.starts_with("Kimi WebBridge is not available")
+}
+
+async fn run_natural_webbridge_request(input: &str) -> String {
+    let Some(query) = youtube_query_from_natural_request(input) else {
+        return "Could not infer a browser action. Try a direct request like `search rust tutorials on youtube` or use a URL.".to_string();
+    };
+
+    let search_url = youtube_search_url(&query);
+    let navigate_result = send_webbridge_command(
+        "navigate",
+        json!({
+            "url": search_url,
+            "newTab": true,
+            "group_title": "TRUST"
+        }),
+        Some("trust".to_string()),
+    )
+    .await;
+
+    if webbridge_unavailable(&navigate_result) || !wants_page_interaction(input) {
+        return navigate_result;
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let wanted_title = requested_title(input).unwrap_or_default();
+    let wanted_title_json =
+        serde_json::to_string(&wanted_title).unwrap_or_else(|_| "\"\"".to_string());
+    let code = format!(
+        r#"(() => {{
+const wanted = {}.toLowerCase();
+const links = Array.from(document.querySelectorAll('a#video-title, ytd-video-renderer a#video-title, ytd-rich-item-renderer a#video-title')).filter((link) => link.href);
+const match = wanted ? links.find((link) => link.textContent.toLowerCase().includes(wanted)) : null;
+const link = match || links[0];
+if (!link) return JSON.stringify({{ success: false, error: 'No YouTube video results found' }});
+const title = link.textContent.trim();
+const href = link.href;
+link.click();
+return JSON.stringify({{ success: true, clicked: title, url: href }});
+}})()"#,
+        wanted_title_json
+    );
+
+    let click_result = send_webbridge_command(
+        "evaluate",
+        json!({ "code": code }),
+        Some("trust".to_string()),
+    )
+    .await;
+
+    format!("{}\n\n{}", navigate_result, click_result)
+}
+
+async fn run_webbridge_tool(tool_call: ToolCall) -> String {
+    let session = tool_call.args.session.or_else(|| Some("trust".to_string()));
+    let action = tool_call
+        .args
+        .action
+        .unwrap_or_else(|| "navigate".to_string())
+        .trim()
+        .to_lowercase();
+
+    match action.as_str() {
+        "navigate" | "open" => {
+            let Some(url) = tool_call.args.url else {
+                return "Missing url for Kimi WebBridge navigate".to_string();
+            };
+            send_webbridge_command(
+                "navigate",
+                json!({
+                    "url": url,
+                    "newTab": tool_call.args.new_tab.unwrap_or(true),
+                    "group_title": "TRUST"
+                }),
+                session,
+            )
+            .await
         }
-
-        history.push(Message {
-            role: "assistant".to_string(),
-            content: full_message.clone(),
-        });
-
-        if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&full_message) {
-            let tool_result = run_tool(tool_call, sandbox);
-
-            println!("{}", tool_result.bright_magenta());
-
-            history.push(Message {
-                role: "user".to_string(),
-                content: format!("Tool result from TRUST runtime: {}", tool_result),
-            });
-
-            if step + 1 < MAX_AGENT_STEPS {
-                continue;
-            }
-
-            println!(
-                "{}",
-                "Stopped after reaching the max autonomous tool steps for one turn."
-                    .bright_yellow()
-            );
+        "snapshot" | "read" => send_webbridge_command("snapshot", json!({}), session).await,
+        "click" => {
+            let Some(selector) = tool_call.args.selector else {
+                return "Missing selector for Kimi WebBridge click".to_string();
+            };
+            send_webbridge_command("click", json!({ "selector": selector }), session).await
         }
-
-        save_history(current_chat, history);
-        return;
+        "fill" | "type" => {
+            let Some(selector) = tool_call.args.selector else {
+                return "Missing selector for Kimi WebBridge fill".to_string();
+            };
+            let Some(value) = tool_call.args.value.or(tool_call.args.content) else {
+                return "Missing value for Kimi WebBridge fill".to_string();
+            };
+            send_webbridge_command(
+                "fill",
+                json!({
+                    "selector": selector,
+                    "value": value
+                }),
+                session,
+            )
+            .await
+        }
+        "evaluate" => {
+            let Some(code) = tool_call.args.content else {
+                return "Missing content code for Kimi WebBridge evaluate".to_string();
+            };
+            send_webbridge_command("evaluate", json!({ "code": code }), session).await
+        }
+        "tabs" | "list_tabs" => send_webbridge_command("list_tabs", json!({}), session).await,
+        "close_tab" => send_webbridge_command("close_tab", json!({}), session).await,
+        other => format!(
+            "Unknown Kimi WebBridge action: {}. Supported actions: navigate, snapshot, click, fill, evaluate, list_tabs, close_tab",
+            other
+        ),
     }
 }
 
-fn chat_path(chat_name: &str) -> String {
-    format!("memory/{}.json", chat_name)
-}
-
-fn save_history(chat_name: &str, history: &Vec<Message>) {
-    fs::create_dir_all("memory").unwrap();
-
-    let json = serde_json::to_string_pretty(history).unwrap();
-
-    fs::write(chat_path(chat_name), json).unwrap();
-}
-
-fn load_history(chat_name: &str) -> Vec<Message> {
-    let data = fs::read_to_string(chat_path(chat_name));
-
-    match data {
-        Ok(content) => serde_json::from_str::<Vec<Message>>(&content)
-            .unwrap_or_else(|_| Vec::new())
-            .into_iter()
-            .map(|message| {
-                if message.role == "tool" {
-                    Message {
-                        role: "user".to_string(),
-                        content: format!("Tool result from TRUST runtime: {}", message.content),
-                    }
-                } else {
-                    message
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
+fn open_url(url: &str) -> String {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return "Blocked unsafe URL. Only http:// and https:// URLs are allowed.".to_string();
     }
-}
 
-fn list_chats() {
-    let paths = fs::read_dir("memory");
-
-    match paths {
-        Ok(entries) => {
-            println!("\nSaved Chats:\n");
-
-            for entry in entries {
-                let entry = entry.unwrap();
-                let file_name = entry.file_name();
-                let file_name = file_name.to_string_lossy();
-                let chat_name = file_name.replace(".json", "");
-
-                println!("- {}", chat_name.bright_cyan());
-            }
-
-            println!();
-        }
-
-        Err(_) => {
-            println!("No chats found.");
-        }
-    }
-}
-
-fn delete_chat(chat_name: &str) {
-    let path = chat_path(chat_name);
-
-    let result = fs::remove_file(path);
-
-    match result {
-        Ok(_) => {
-            println!("Deleted chat: {}", chat_name.bright_red());
-        }
-
-        Err(_) => {
-            println!("Chat not found: {}", chat_name.bright_red());
-        }
-    }
+    open_app("chrome", Some(url.to_string()))
 }
 
 fn open_app(app: &str, url: Option<String>) -> String {
@@ -1182,62 +1448,11 @@ fn read_runtime_file(config: &SandboxConfig, requested_path: &str) -> String {
     }
 }
 
-fn allowed_sandbox_command(command: &str) -> Option<AllowedCommand> {
-    let normalized = command.trim().to_lowercase();
-
-    match normalized.as_str() {
-        "cargo check" => Some(AllowedCommand {
-            display: "cargo check",
-            program: "cargo",
-            args: &["check"],
-        }),
-        "cargo test" => Some(AllowedCommand {
-            display: "cargo test",
-            program: "cargo",
-            args: &["test"],
-        }),
-        "cargo fmt --check" => Some(AllowedCommand {
-            display: "cargo fmt --check",
-            program: "cargo",
-            args: &["fmt", "--check"],
-        }),
-        "cargo clippy" => Some(AllowedCommand {
-            display: "cargo clippy",
-            program: "cargo",
-            args: &["clippy"],
-        }),
-        _ => None,
-    }
-}
-
-fn run_sandboxed_command(config: &SandboxConfig, command: &str) -> String {
-    let Some(allowed_command) = allowed_sandbox_command(command) else {
-        return format!(
-            "Blocked command: {}. Allowed sandbox commands: cargo check, cargo test, cargo fmt --check, cargo clippy",
-            command
-        );
-    };
-
-    let approval_prompt = format!(
-        "\nApprove sandboxed command? {}\n  cwd: {}\n  timeout: {} ms\nType y/yes to allow: ",
-        allowed_command.display,
-        display_path(&config.workspace),
-        config.command_timeout_ms
-    );
-
-    if !read_approval_input(&approval_prompt) {
-        return format!("User denied sandboxed command: {}", allowed_command.display);
-    }
-
-    execute_command_with_timeout(
-        config,
-        allowed_command.program,
-        allowed_command.args,
-        allowed_command.display,
-    )
-}
-
-fn run_tool(tool_call: ToolCall, sandbox: &SandboxConfig) -> String {
+async fn run_tool(
+    tool_call: ToolCall,
+    sandbox: &SandboxConfig,
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+) -> String {
     match tool_call.tool.as_str() {
         "write_file" => {
             let Some(path) = tool_call.args.path else {
@@ -1249,10 +1464,10 @@ fn run_tool(tool_call: ToolCall, sandbox: &SandboxConfig) -> String {
                 Err(error) => return error,
             };
 
-            if let Some(parent) = resolved_path.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    return format!("Failed to create parent directory for {}: {}", path, e);
-                }
+            if let Some(parent) = resolved_path.parent()
+                && let Err(e) = fs::create_dir_all(parent)
+            {
+                return format!("Failed to create parent directory for {}: {}", path, e);
             }
 
             let content = tool_call.args.content.unwrap_or_default();
@@ -1262,7 +1477,6 @@ fn run_tool(tool_call: ToolCall, sandbox: &SandboxConfig) -> String {
                 Err(e) => format!("Failed to save file {}: {}", path, e),
             }
         }
-
         "read_file" => {
             let Some(path) = tool_call.args.path else {
                 return "Missing path for read_file".to_string();
@@ -1270,7 +1484,6 @@ fn run_tool(tool_call: ToolCall, sandbox: &SandboxConfig) -> String {
 
             read_runtime_file(sandbox, &path)
         }
-
         "list_directory" => {
             let Some(path) = tool_call.args.path else {
                 return "Missing path for list_directory".to_string();
@@ -1278,9 +1491,25 @@ fn run_tool(tool_call: ToolCall, sandbox: &SandboxConfig) -> String {
 
             list_runtime_directory(sandbox, &path)
         }
-
         "open_chrome" => open_app("chrome", tool_call.args.url),
+        "kimi_webbridge" | "web_bridge" | "browser_control" => run_webbridge_tool(tool_call).await,
+        "open_url" => {
+            let Some(url) = tool_call.args.url else {
+                return "Missing url for open_url".to_string();
+            };
 
+            open_url(&url)
+        }
+        "web_search" => {
+            let Some(query) = tool_call.args.content else {
+                return "Missing content query for web_search".to_string();
+            };
+            let encoded_query = query.trim().replace(' ', "+");
+            open_url(&format!(
+                "https://www.google.com/search?q={}",
+                encoded_query
+            ))
+        }
         "open_app" => {
             let Some(app) = tool_call.args.app else {
                 return "Missing app for open_app".to_string();
@@ -1288,340 +1517,951 @@ fn run_tool(tool_call: ToolCall, sandbox: &SandboxConfig) -> String {
 
             open_app(&app, tool_call.args.url)
         }
-
         "run_sandboxed_command" => {
             let Some(command) = tool_call.args.command else {
                 return "Missing command for run_sandboxed_command".to_string();
             };
 
-            run_sandboxed_command(sandbox, &command)
+            run_sandboxed_command(sandbox, &command, event_tx).await
         }
-
         "run_command" => {
             let Some(command) = tool_call.args.command else {
                 return "Missing command for run_command".to_string();
             };
 
-            run_command(sandbox, &command)
+            run_command(sandbox, &command, event_tx).await
         }
-
         _ => format!("Unknown tool: {}", tool_call.tool),
     }
 }
-fn credits() {
-    println!("\n{}", "━".repeat(60).bright_black());
-    println!("🤖 {}", "Terminal AI Assistant".bold().bright_cyan());
-    println!(
-        "{}\n",
-        "Fast, Secure, and Memory Safe".italic().bright_black()
-    );
 
-    println!(
-        "{}   {}",
-        "Developer:".bright_yellow().bold(),
-        "Daniel Santhosh".green()
-    );
-    println!(
-        "{} {}",
-        "Powered by:".bright_magenta().bold(),
-        "Rust 🦀".bright_red()
-    );
-    println!(
-        "{}  {}",
-        "Repository:".bright_yellow().bold(),
-        "https://github.com/danielzanthosh/trust"
-            .underline()
-            .bright_blue()
-    );
-    println!("{}\n", "━".repeat(60).bright_black());
-}
+async fn process_turn(
+    current_chat: String,
+    mut history: Vec<Message>,
+    sandbox: SandboxConfig,
+    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+) {
+    let _ = event_tx.send(RuntimeEvent::Status("Waiting for model...".to_string()));
 
-#[tokio::main]
-async fn main() {
-    dotenv().ok();
+    for step in 0..MAX_AGENT_STEPS {
+        let full_message = match request_model_reply(&history, &event_tx).await {
+            Ok(message) => message,
+            Err(error) => {
+                let _ = event_tx.send(RuntimeEvent::Error(error));
+                return;
+            }
+        };
 
-    let sandbox = match SandboxConfig::load().and_then(|config| {
-        ensure_sandbox_ready(&config)?;
-        Ok(config)
-    }) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("Sandbox Error: {}", error);
-            return;
-        }
-    };
+        if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&full_message) {
+            history.push(Message {
+                role: "assistant".to_string(),
+                content: full_message,
+            });
 
-    intro(&sandbox);
+            let _ = event_tx.send(RuntimeEvent::DiscardAssistantDraft);
+            let _ = event_tx.send(RuntimeEvent::Status(format!(
+                "Running tool: {}",
+                tool_call.tool
+            )));
 
-    let mut current_chat = "default".to_string();
-    let mut history = load_history(&current_chat);
+            let tool_result = run_tool(tool_call, &sandbox, &event_tx).await;
+            let _ = event_tx.send(RuntimeEvent::ToolResult(tool_result.clone()));
 
-    history.push(Message {
-        role: "system".to_string(),
-        content: r#"
-    You are TRUST.
+            history.push(Message {
+                role: "user".to_string(),
+                content: format!("{}{}", TOOL_RESULT_PREFIX, tool_result),
+            });
 
-    You are a helpful terminal AI with safe agentic control.
-    Use tools only when the user clearly asks for an action on the computer, files, apps, or sandbox.
-    For normal conversation, answer normally and do not call tools.
-    You may use multiple tools across multiple steps in a single turn.
-    When using a tool, reply ONLY with JSON and no extra text.
-    After a tool runs, you will receive a follow-up message that starts with "Tool result from TRUST runtime:".
-    Use that result to decide your next step or produce a final answer.
+            if step + 1 < MAX_AGENT_STEPS {
+                continue;
+            }
 
-    You operate with controlled autonomy inside a sandbox.
-    File tools resolve only inside the sandbox directories: workspace/, outputs/, and temp/.
-    If a path does not start with one of those prefixes, it is treated as relative to workspace/.
-
-    Example write_file tool call:
-
-    {
-      "type": "tool_call",
-      "tool": "write_file",
-      "args": {
-        "path": "outputs/test.md",
-        "content": "Hello world"
-      }
-    }
-
-    Example read_file tool call:
-
-    {
-      "type": "tool_call",
-      "tool": "read_file",
-      "args": {
-        "path": "outputs/test.md"
-      }
-    }
-
-    Example list_directory tool call:
-
-    {
-      "type": "tool_call",
-      "tool": "list_directory",
-      "args": {
-        "path": "outputs"
-      }
-    }
-
-    Example open_app tool call:
-
-    {
-      "type": "tool_call",
-      "tool": "open_app",
-      "args": {
-        "app": "chrome"
-      }
-    }
-
-    Example open_app with URL:
-
-    {
-      "type": "tool_call",
-      "tool": "open_app",
-      "args": {
-        "app": "chrome",
-        "url": "https://www.google.com"
-      }
-    }
-
-    Example sandboxed command:
-
-    {
-      "type": "tool_call",
-      "tool": "run_sandboxed_command",
-      "args": {
-        "command": "cargo check"
-      }
-    }
-
-    Example broader command request:
-
-    {
-      "type": "tool_call",
-      "tool": "run_command",
-      "args": {
-        "command": "cargo check"
-      }
-    }
-
-    Allowed tools:
-    - write_file: reads and writes only inside sandboxed workspace/, outputs/, or temp/
-    - read_file: only reads inside sandboxed workspace/, outputs/, or temp/
-    - list_directory: only lists inside sandboxed workspace/, outputs/, or temp/
-    - open_app: opens allowed apps only. Allowed apps: chrome, edge, firefox, notepad, calculator, explorer, paint, wordpad, vscode
-    - open_chrome: alias for opening Chrome
-    - run_sandboxed_command: runs allowlisted project commands only inside sandbox/workspace after user approval. Allowed commands: cargo check, cargo test, cargo fmt --check, cargo clippy
-    - run_command: may request broader shell commands inside sandbox/workspace. The runtime decides whether to execute the command, whether approval is required, and whether the command is blocked.
-
-    Safety rules:
-    - Do not claim you cannot interact with the computer when an allowed tool can do the task.
-    - Do not read or write outside the sandbox, modify system settings, install software, download files, or access private data such as .env files.
-    - You may request run_command when needed, but the runtime decides whether it executes.
-    - Destructive commands may be blocked unless ALLOW_DESTRUCTIVE_ACTIONS=true and the user explicitly approves them.
-    - If the runtime blocks a command, explain that the runtime blocked it.
-    - Never claim a command ran unless the runtime returns a tool result confirming it ran.
-    - Never pretend to save files, read files, list directories, open apps, or run commands. Use a tool when available.
-    - If a tool is useful, prefer actually using it over just describing what would happen.
-    - Only use JSON when calling tools.
-
-    "#
-        .to_string(),
-    });
-
-    loop {
-        print!("{} > ", current_chat.bright_cyan());
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            eprintln!("Failed to read input");
-            continue;
-        }
-
-        let input = input.trim();
-
-        if input.is_empty() {
-            continue;
-        }
-
-        if input == "/exit" || input == "/quit" {
+            let stop_message =
+                "Stopped after reaching the max autonomous tool steps for one turn.".to_string();
+            history.push(Message {
+                role: "assistant".to_string(),
+                content: stop_message.clone(),
+            });
+            let _ = event_tx.send(RuntimeEvent::CommitAssistant(stop_message));
             break;
         }
 
-        if input == "/list" {
-            list_chats();
-            continue;
-        }
+        let final_message = if response_claims_destructive_action(&full_message) {
+            "Blocked destructive command: assistant claimed execution without a runtime tool result"
+                .to_string()
+        } else {
+            full_message
+        };
 
-        if input == "/credits" {
-            credits();
-            continue;
-        }
+        history.push(Message {
+            role: "assistant".to_string(),
+            content: final_message.clone(),
+        });
+        let _ = event_tx.send(RuntimeEvent::CommitAssistant(final_message));
+        break;
+    }
 
-        if input == "/clear" {
-            history.clear();
-            save_history(&current_chat, &history);
-            println!("Cleared chat: {}", current_chat.bright_red());
-            continue;
-        }
+    save_history(&current_chat, &history);
+    let _ = event_tx.send(RuntimeEvent::TurnFinished(history));
+}
 
-        if let Some(chat_name) = input.strip_prefix("/chat ") {
-            let chat_name = chat_name.trim();
+fn system_prompt() -> String {
+    r#"
+You are TRUST.
 
-            if chat_name.is_empty() {
-                println!("Usage: /chat <name>");
-                continue;
-            }
+You are a helpful terminal AI with safe agentic control.
+Use tools only when the user clearly asks for an action on the computer, files, apps, or sandbox.
+For normal conversation, answer normally and do not call tools.
+You may use multiple tools across multiple steps in a single turn.
+When using a tool, reply ONLY with JSON and no extra text.
+After a tool runs, you will receive a follow-up message that starts with "Tool result from TRUST runtime:".
+Use that result to decide your next step or produce a final answer.
 
-            current_chat = chat_name.to_string();
-            history = load_history(&current_chat);
-            println!("Switched to chat: {}", current_chat.bright_cyan());
-            continue;
-        }
+You operate with controlled autonomy inside a sandbox.
+File tools resolve only inside the sandbox directories: workspace/, outputs/, and temp/.
+If a path does not start with one of those prefixes, it is treated as relative to workspace/.
 
-        if let Some(chat_name) = input.strip_prefix("/delete ") {
-            let chat_name = chat_name.trim();
+Example write_file tool call:
+{
+  "type": "tool_call",
+  "tool": "write_file",
+  "args": {
+    "path": "outputs/example.md",
+    "content": "Hello world"
+  }
+}
 
-            if chat_name.is_empty() {
-                println!("Usage: /delete <name>");
-                continue;
-            }
+Example run_command tool call:
+{
+  "type": "tool_call",
+  "tool": "run_command",
+  "args": {
+    "command": "cargo check"
+  }
+}
 
-            delete_chat(chat_name);
+Example Kimi WebBridge navigate tool call:
+{
+  "type": "tool_call",
+  "tool": "kimi_webbridge",
+  "args": {
+    "action": "navigate",
+    "url": "https://www.youtube.com",
+    "new_tab": true,
+    "session": "trust"
+  }
+}
 
-            if chat_name == current_chat {
-                history.clear();
-            }
+Example Kimi WebBridge page read tool call:
+{
+  "type": "tool_call",
+  "tool": "kimi_webbridge",
+  "args": {
+    "action": "snapshot",
+    "session": "trust"
+  }
+}
 
-            continue;
-        }
+Example Kimi WebBridge click/fill tool calls:
+{
+  "type": "tool_call",
+  "tool": "kimi_webbridge",
+  "args": {
+    "action": "click",
+    "selector": "@e1",
+    "session": "trust"
+  }
+}
+{
+  "type": "tool_call",
+  "tool": "kimi_webbridge",
+  "args": {
+    "action": "fill",
+    "selector": "@e2",
+    "value": "search text",
+    "session": "trust"
+  }
+}
 
-        handle_input(input, &current_chat, &mut history, &sandbox).await;
+Allowed tools:
+- write_file: reads and writes only inside sandboxed workspace/, outputs/, or temp/
+- read_file: only reads inside sandboxed workspace/, outputs/, or temp/
+- list_directory: only lists inside sandboxed workspace/, outputs/, or temp/
+- open_app: opens allowed apps only. Allowed apps: chrome, edge, firefox, notepad, calculator, explorer, paint, wordpad, vscode
+- open_chrome: alias for opening Chrome
+- open_url: opens http:// or https:// URLs in Chrome
+- web_search: opens a Google search for the query in the content field
+- kimi_webbridge: full browser control through Kimi WebBridge. Actions: navigate, snapshot, click, fill, evaluate, list_tabs, close_tab. If WebBridge is not installed or connected, the runtime asks the user to install/start it first.
+- run_sandboxed_command: runs allowlisted project commands only inside sandbox/workspace after user approval. Allowed commands: cargo check, cargo fmt --check, cargo clippy
+- run_command: may request broader shell commands inside sandbox/workspace. The runtime decides whether to execute the command, whether approval is required, and whether the command is blocked.
+
+Safety rules:
+- Do not claim you cannot interact with the computer or browser when an allowed tool can do the task.
+- If the user asks to open a website, browser, Chrome, YouTube, or a URL, use open_app, open_chrome, open_url, web_search, or kimi_webbridge instead of refusing.
+- If the user asks to read, click, type, search inside, inspect, screenshot mentally, or interact with a webpage, use kimi_webbridge. If the tool result says Kimi WebBridge is not available, tell the user to install the browser extension and start the device daemon first.
+- Do not read or write outside the sandbox, modify system settings, install software, download files, or access private data such as .env files.
+- You may request run_command when needed, but the runtime decides whether it executes.
+- Destructive commands may be blocked unless ALLOW_DESTRUCTIVE_ACTIONS=true and the user explicitly approves them.
+- If the runtime blocks a command, explain that the runtime blocked it.
+- Never claim a command ran unless the runtime returns a tool result confirming it ran.
+- Never pretend to save files, read files, list directories, open apps, or run commands. Use a tool when available.
+- If a tool is useful, prefer actually using it over just describing what would happen.
+- Only use JSON when calling tools.
+"#
+    .to_string()
+}
+
+fn ensure_system_message(mut history: Vec<Message>) -> Vec<Message> {
+    let prompt = system_prompt();
+
+    if let Some(system_message) = history.iter_mut().find(|message| message.role == "system") {
+        system_message.content = prompt;
+    } else {
+        history.insert(
+            0,
+            Message {
+                role: "system".to_string(),
+                content: prompt,
+            },
+        );
+    }
+
+    history
+}
+
+fn chat_path(chat_name: &str) -> String {
+    format!("memory/{}.json", chat_name)
+}
+
+fn save_history(chat_name: &str, history: &[Message]) {
+    let _ = fs::create_dir_all("memory");
+    if let Ok(json) = serde_json::to_string_pretty(history) {
+        let _ = fs::write(chat_path(chat_name), json);
     }
 }
 
-//    .------..------..------..------..------.
-//    |T.--. ||R.--. ||U.--. ||S.--. ||T.--. |
-//    | :/\: || :(): || (\/) || :/\: || :/\: |
-//    | (__) || ()() || :\/: || :\/: || (__) |
-//    | '--'T|| '--'R|| '--'U|| '--'S|| '--'T|
-//    `------'`------'`------'`------'`------'
+fn load_history(chat_name: &str) -> Vec<Message> {
+    let data = fs::read_to_string(chat_path(chat_name));
 
-fn intro(sandbox: &SandboxConfig) {
-    println!("{}", ".------..------..------..------..------.".red());
-    println!(
-        "{}",
-        "|T.--. ||R.--. ||U.--. ||S.--. ||T.--. |".bright_red()
-    );
-    println!("{}", "| :/\\: || :(): || (\\/) || :/\\: || :/\\: |".red());
-    println!("{}", "| (__) || ()() || :\\/: || :\\/: || (__) |".red());
-    println!(
-        "{}",
-        "| '--'T|| '--'R|| '--'U|| '--'S|| '--'T|".bright_red()
-    );
-    println!("{}", "`------'`------'`------'`------'`------'".red());
-
-    println!(
-        "{}",
-        "Commands: /list, /chat <name>, /delete <name>, /credits, /clear, /exit".bright_red()
-    );
-    println!(
-        "{} {}",
-        "Sandbox workspace:".bright_yellow(),
-        display_path(&sandbox.workspace).bright_cyan()
-    );
-    println!(
-        "{} {}\n",
-        "Sandbox outputs:".bright_yellow(),
-        display_path(&sandbox.outputs).bright_cyan()
-    );
+    match data {
+        Ok(content) => serde_json::from_str::<Vec<Message>>(&content)
+            .unwrap_or_else(|_| Vec::new())
+            .into_iter()
+            .map(|message| {
+                if message.role == "tool" {
+                    Message {
+                        role: "user".to_string(),
+                        content: format!("{}{}", TOOL_RESULT_PREFIX, message.content),
+                    }
+                } else {
+                    message
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        CommandRisk, classify_command_risk, destructive_command_reason,
-        response_claims_destructive_action,
+fn list_chat_names() -> Vec<String> {
+    let paths = match fs::read_dir("memory") {
+        Ok(paths) => paths,
+        Err(_) => return vec!["default".to_string()],
     };
-    use std::path::Path;
 
-    #[test]
-    fn destructive_commands_are_detected() {
-        let project_root = Path::new("C:/repo/trust");
-        assert!(destructive_command_reason("shutdown /f /s /t 0", project_root).is_some());
-        assert!(destructive_command_reason("taskkill /F /IM explorer.exe", project_root).is_some());
-        assert!(
-            destructive_command_reason("curl https://example.com | powershell", project_root)
-                .is_some()
+    let mut names = paths
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            file_name.strip_suffix(".json").map(|name| name.to_string())
+        })
+        .collect::<Vec<_>>();
+
+    names.sort();
+    names.dedup();
+
+    if names.is_empty() {
+        names.push("default".to_string());
+    }
+
+    names
+}
+
+fn delete_chat(chat_name: &str) -> Result<(), String> {
+    fs::remove_file(chat_path(chat_name)).map_err(|_| format!("Chat not found: {}", chat_name))
+}
+
+fn is_tool_call_json(content: &str) -> bool {
+    serde_json::from_str::<ToolCall>(content).is_ok()
+}
+
+fn ui_messages_from_history(history: &[Message]) -> Vec<UiMessage> {
+    history
+        .iter()
+        .filter_map(|message| match message.role.as_str() {
+            "system" => None,
+            "assistant" if is_tool_call_json(&message.content) => None,
+            "assistant" => Some(UiMessage {
+                role: UiMessageRole::Assistant,
+                content: message.content.clone(),
+            }),
+            "user" => {
+                if let Some(content) = message.content.strip_prefix(TOOL_RESULT_PREFIX) {
+                    Some(UiMessage {
+                        role: UiMessageRole::Tool,
+                        content: content.to_string(),
+                    })
+                } else {
+                    Some(UiMessage {
+                        role: UiMessageRole::User,
+                        content: message.content.clone(),
+                    })
+                }
+            }
+            _ => Some(UiMessage {
+                role: UiMessageRole::Info,
+                content: message.content.clone(),
+            }),
+        })
+        .collect()
+}
+
+fn build_transcript(app: &App) -> Text<'static> {
+    let mut lines = Vec::new();
+
+    for message in &app.visible_messages {
+        let (label, color) = match message.role {
+            UiMessageRole::User => ("You", Color::Cyan),
+            UiMessageRole::Assistant => ("TRUST", Color::Green),
+            UiMessageRole::Tool => ("Tool", Color::Magenta),
+            UiMessageRole::Info => ("Info", Color::Yellow),
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}: ", label),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(message.content.clone()),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    if !app.draft_assistant.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "TRUST: ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.draft_assistant.clone()),
+        ]));
+    }
+
+    Text::from(lines)
+}
+
+fn transcript_line_count(app: &App) -> usize {
+    app.visible_messages.len().saturating_mul(2)
+        + usize::from(!app.draft_assistant.trim().is_empty())
+}
+
+fn resolved_transcript_scroll(app: &App, viewport_height: u16) -> u16 {
+    let content_lines = transcript_line_count(app) as u16;
+    let max_scroll = content_lines.saturating_sub(viewport_height);
+
+    if app.auto_scroll || app.transcript_scroll == u16::MAX {
+        max_scroll
+    } else {
+        app.transcript_scroll.min(max_scroll)
+    }
+}
+
+fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let root = frame.area();
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(24), Constraint::Min(40)])
+        .split(root);
+
+    let sidebar_area = horizontal[0];
+    let main_area = horizontal[1];
+
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(10),
+            Constraint::Length(3),
+            Constraint::Length(4),
+        ])
+        .split(main_area);
+
+    let chats = list_chat_names();
+    let items = chats
+        .iter()
+        .map(|chat| {
+            let style = if chat == &app.current_chat {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            ListItem::new(chat.clone()).style(style)
+        })
+        .collect::<Vec<_>>();
+
+    let chats_list = List::new(items).block(
+        Block::default()
+            .title("Chats")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)),
+    );
+    frame.render_widget(chats_list, sidebar_area);
+
+    let transcript_area = vertical[0];
+    let transcript_inner_height = transcript_area.height.saturating_sub(2);
+    let transcript_scroll = resolved_transcript_scroll(app, transcript_inner_height);
+    let transcript_title = format!(
+        "Conversation · ↑/↓ scroll · PgUp/PgDn jump · End newest · {} messages",
+        app.visible_messages.len()
+    );
+    let transcript = Paragraph::new(build_transcript(app))
+        .block(
+            Block::default()
+                .title(transcript_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        )
+        .scroll((transcript_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(transcript, transcript_area);
+
+    let mut scrollbar_state = ScrollbarState::new(transcript_line_count(app))
+        .position(transcript_scroll as usize)
+        .viewport_content_length(transcript_inner_height as usize);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .track_symbol(Some("│"))
+        .thumb_symbol("█")
+        .begin_symbol(Some("▲"))
+        .end_symbol(Some("▼"));
+    frame.render_stateful_widget(scrollbar, transcript_area, &mut scrollbar_state);
+
+    let status_style = if app.busy {
+        Style::default().fg(Color::LightYellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let status = Paragraph::new(app.status.clone())
+        .style(status_style)
+        .block(
+            Block::default()
+                .title(format!(
+                    "Status · chat={} · busy={} · sandbox={}",
+                    app.current_chat,
+                    if app.busy { "yes" } else { "no" },
+                    display_path(&app.sandbox.workspace)
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
         );
+    frame.render_widget(status, vertical[1]);
+
+    let input_title = if app.busy {
+        "Input · waiting for TRUST"
+    } else {
+        "Input · Enter send · Tab chat · Ctrl+C quit"
+    };
+    let input = Paragraph::new(app.input.clone())
+        .style(Style::default().fg(Color::LightCyan))
+        .block(
+            Block::default()
+                .title(input_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(input, vertical[2]);
+
+    let cursor_x = vertical[2].x + 1 + app.input.chars().count() as u16;
+    let cursor_y = vertical[2].y + 1;
+    frame.set_cursor_position((cursor_x, cursor_y));
+
+    if let Some(pending) = &app.pending_approval {
+        let popup = centered_rect(70, if pending.allow_always { 40 } else { 35 }, root);
+        frame.render_widget(Clear, popup);
+
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                format!("{}: {}", pending.title, pending.command),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )]),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Risk: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(pending.risk_label.clone()),
+            ]),
+            Line::raw(""),
+            Line::raw("[A] Allow once"),
+        ];
+
+        if pending.allow_always {
+            lines.push(Line::raw("[L] Allow always"));
+        }
+        lines.push(Line::raw("[D] Decline"));
+
+        let help = if pending.allow_always {
+            "Choose A, L, or D"
+        } else {
+            "Choose A or D"
+        };
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            help,
+            Style::default().fg(Color::Yellow),
+        )));
+
+        let paragraph = Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .block(
+                Block::default()
+                    .title("Permission Required")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, popup);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn credits_text() -> String {
+    [
+        "TRUST — Terminal Runtime for Unified Smart Tasks",
+        "Developer: Daniel Santhosh",
+        "Repository: https://github.com/danielzanthosh/trust",
+    ]
+    .join("\n")
+}
+
+fn youtube_search_url(query: &str) -> String {
+    format!(
+        "https://www.youtube.com/results?search_query={}",
+        query.trim().replace(' ', "+")
+    )
+}
+
+fn google_search_url(query: &str) -> String {
+    format!(
+        "https://www.google.com/search?q={}",
+        query.trim().replace(' ', "+")
+    )
+}
+
+fn split_before_task_suffix(text: &str) -> &str {
+    text.split_once(",")
+        .map(|(before, _)| before)
+        .or_else(|| text.split_once(" then ").map(|(before, _)| before))
+        .unwrap_or(text)
+        .trim()
+}
+
+fn youtube_query_from_natural_request(input: &str) -> Option<String> {
+    let normalized = input.trim().to_lowercase();
+
+    let query = normalized
+        .strip_prefix("search ")
+        .or_else(|| normalized.strip_prefix("search for "))
+        .or_else(|| normalized.strip_prefix("find "))
+        .or_else(|| normalized.strip_prefix("look up "))?;
+
+    let query = query
+        .split_once(" on youtube")
+        .map(|(before, _)| before)
+        .or_else(|| query.split_once(" in youtube").map(|(before, _)| before))
+        .or_else(|| query.split_once(" on yt").map(|(before, _)| before))
+        .or_else(|| query.split_once(" in yt").map(|(before, _)| before))?;
+
+    let query = split_before_task_suffix(query).trim();
+    (!query.is_empty()).then(|| query.to_string())
+}
+
+fn wants_page_interaction(input: &str) -> bool {
+    let normalized = input.trim().to_lowercase();
+    [
+        "click",
+        "play",
+        "open first",
+        "first song",
+        "first video",
+        "select",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn requested_title(input: &str) -> Option<String> {
+    let normalized = input.trim().to_lowercase();
+    let title = normalized
+        .split_once(" called ")
+        .map(|(_, after)| after)
+        .or_else(|| normalized.split_once(" titled ").map(|(_, after)| after))?;
+    let title = title.trim().trim_matches(['.', ',', '"', '\'']);
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+fn should_use_webbridge_directly(input: &str) -> bool {
+    let normalized = input.trim().to_lowercase();
+    normalized.contains("youtube") && wants_page_interaction(&normalized)
+}
+
+fn direct_browser_url(input: &str) -> Option<String> {
+    let normalized = input.trim().to_lowercase();
+
+    if normalized == "open youtube"
+        || normalized == "open youtube in chrome"
+        || normalized == "launch youtube"
+    {
+        return Some("https://www.youtube.com".to_string());
     }
 
-    #[test]
-    fn protected_paths_are_treated_as_destructive() {
-        let project_root = Path::new("C:/repo/trust");
-        assert!(destructive_command_reason("type .env", project_root).is_some());
-        assert!(destructive_command_reason("dir C:/Windows/System32", project_root).is_some());
-        assert!(destructive_command_reason("del /s sandbox", project_root).is_some());
+    if let Some(url) = normalized.strip_prefix("open ")
+        && (url.starts_with("https://") || url.starts_with("http://"))
+    {
+        return Some(url.to_string());
     }
 
-    #[test]
-    fn non_destructive_commands_need_approval_by_default() {
-        let project_root = Path::new("C:/repo/trust");
-        assert_eq!(
-            classify_command_risk("echo hello", project_root).unwrap(),
-            CommandRisk::NeedsApproval
-        );
+    if let Some(query) = normalized.strip_prefix("search web for ") {
+        return Some(google_search_url(query));
     }
 
-    #[test]
-    fn detects_destructive_action_claims() {
-        assert!(response_claims_destructive_action(
-            "Shutting down the PC now."
-        ));
-        assert!(response_claims_destructive_action("Rebooting now."));
-        assert!(!response_claims_destructive_action(
-            "The runtime blocked the shutdown command."
-        ));
+    if let Some(query) = normalized.strip_prefix("google ") {
+        return Some(google_search_url(query));
     }
+
+    if let Some(query) = normalized.strip_prefix("search youtube for ") {
+        return Some(youtube_search_url(query));
+    }
+
+    if let Some(query) = normalized.strip_prefix("youtube search ") {
+        return Some(youtube_search_url(query));
+    }
+
+    if let Some(query) = normalized
+        .strip_prefix("search ")
+        .and_then(|query| query.strip_suffix(" on youtube"))
+    {
+        return Some(youtube_search_url(query));
+    }
+
+    if let Some(query) = normalized
+        .strip_prefix("search for ")
+        .and_then(|query| query.strip_suffix(" on youtube"))
+    {
+        return Some(youtube_search_url(query));
+    }
+
+    if let Some(query) = normalized
+        .strip_prefix("find ")
+        .and_then(|query| query.strip_suffix(" on youtube"))
+    {
+        return Some(youtube_search_url(query));
+    }
+
+    None
+}
+
+fn direct_browser_action(input: &str) -> Option<String> {
+    let normalized = input.trim().to_lowercase();
+
+    if normalized == "open chrome"
+        || normalized == "open google chrome"
+        || normalized == "launch chrome"
+        || normalized == "open browser"
+    {
+        return Some(open_app("chrome", None));
+    }
+
+    direct_browser_url(input).map(|url| open_url(&url))
+}
+
+fn handle_local_command(app: &mut App, input: &str) -> bool {
+    if input == "/exit" || input == "/quit" {
+        app.should_quit = true;
+        return true;
+    }
+
+    if input == "/list" {
+        let chats = list_chat_names();
+        app.add_info_message(format!("Saved chats:\n{}", chats.join("\n")));
+        app.status = "Listed chats".to_string();
+        return true;
+    }
+
+    if input == "/credits" {
+        app.add_info_message(credits_text());
+        app.status = "Displayed credits".to_string();
+        return true;
+    }
+
+    if input == "/clear" {
+        app.visible_messages.clear();
+        app.model_history = ensure_system_message(Vec::new());
+        save_history(&app.current_chat, &app.model_history);
+        app.status = format!("Cleared chat: {}", app.current_chat);
+        return true;
+    }
+
+    if let Some(chat_name) = input.strip_prefix("/chat ") {
+        let chat_name = chat_name.trim();
+        if chat_name.is_empty() {
+            app.add_info_message("Usage: /chat <name>");
+            return true;
+        }
+        app.set_chat(chat_name.to_string());
+        return true;
+    }
+
+    if let Some(chat_name) = input.strip_prefix("/delete ") {
+        let chat_name = chat_name.trim();
+        if chat_name.is_empty() {
+            app.add_info_message("Usage: /delete <name>");
+            return true;
+        }
+
+        match delete_chat(chat_name) {
+            Ok(()) => {
+                app.status = format!("Deleted chat: {}", chat_name);
+                if chat_name == app.current_chat {
+                    app.set_chat("default".to_string());
+                }
+            }
+            Err(error) => {
+                app.status = error.clone();
+                app.add_info_message(error);
+            }
+        }
+        return true;
+    }
+
+    if let Some(result) = direct_browser_action(input) {
+        app.add_user_message(input.to_string());
+        app.add_tool_message(result.clone());
+        app.model_history.push(Message {
+            role: "user".to_string(),
+            content: input.to_string(),
+        });
+        app.model_history.push(Message {
+            role: "user".to_string(),
+            content: format!("{}{}", TOOL_RESULT_PREFIX, result),
+        });
+        save_history(&app.current_chat, &app.model_history);
+        app.status = "Browser action completed".to_string();
+        app.scroll_to_bottom();
+        return true;
+    }
+
+    false
+}
+
+async fn process_direct_webbridge_turn(
+    current_chat: String,
+    mut history: Vec<Message>,
+    input: String,
+    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+) {
+    let _ = event_tx.send(RuntimeEvent::Status(
+        "Using Kimi WebBridge for browser control...".to_string(),
+    ));
+
+    let result = run_natural_webbridge_request(&input).await;
+    let _ = event_tx.send(RuntimeEvent::ToolResult(result.clone()));
+
+    history.push(Message {
+        role: "user".to_string(),
+        content: format!("{}{}", TOOL_RESULT_PREFIX, result),
+    });
+
+    save_history(&current_chat, &history);
+    let _ = event_tx.send(RuntimeEvent::TurnFinished(history));
+}
+
+fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+    let input = app.input.trim().to_string();
+    if input.is_empty() || app.busy {
+        return;
+    }
+
+    if handle_local_command(app, &input) {
+        app.input.clear();
+        return;
+    }
+
+    app.scroll_to_bottom();
+    app.add_user_message(input.clone());
+    app.model_history.push(Message {
+        role: "user".to_string(),
+        content: input.clone(),
+    });
+    save_history(&app.current_chat, &app.model_history);
+
+    app.input.clear();
+    app.busy = true;
+    app.draft_assistant.clear();
+
+    let current_chat = app.current_chat.clone();
+    let history = app.model_history.clone();
+    let runtime_tx = event_tx.clone();
+
+    if should_use_webbridge_directly(&input) {
+        app.status = "Using Kimi WebBridge for browser control...".to_string();
+        tokio::spawn(async move {
+            process_direct_webbridge_turn(current_chat, history, input, runtime_tx).await;
+        });
+        return;
+    }
+
+    app.status = "Submitting prompt...".to_string();
+    let sandbox = app.sandbox.clone();
+
+    tokio::spawn(async move {
+        process_turn(current_chat, history, sandbox, runtime_tx).await;
+    });
+}
+
+fn handle_key_event(app: &mut App, key: KeyEvent, event_tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+
+    if let Some(pending) = app.pending_approval.take() {
+        let choice = match key.code {
+            KeyCode::Char('a') | KeyCode::Char('A') => Some(PermissionChoice::AllowOnce),
+            KeyCode::Char('l') | KeyCode::Char('L') if pending.allow_always => {
+                Some(PermissionChoice::AllowAlways)
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                Some(PermissionChoice::Decline)
+            }
+            _ => None,
+        };
+
+        if let Some(choice) = choice {
+            let command = pending.command.clone();
+            let _ = pending.responder.send(choice);
+            app.status = format!("Resolved approval for: {}", command);
+        } else {
+            app.pending_approval = Some(pending);
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        KeyCode::Enter => submit_current_input(app, event_tx),
+        KeyCode::Up => app.scroll_up(1),
+        KeyCode::Down => app.scroll_down(1),
+        KeyCode::PageUp => app.scroll_up(8),
+        KeyCode::PageDown => app.scroll_down(8),
+        KeyCode::Home => {
+            app.transcript_scroll = 0;
+            app.auto_scroll = false;
+        }
+        KeyCode::End => app.scroll_to_bottom(),
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char(ch) => {
+            app.input.push(ch);
+        }
+        KeyCode::Tab => {
+            let chats = list_chat_names();
+            if let Some(index) = chats.iter().position(|chat| chat == &app.current_chat) {
+                let next = chats[(index + 1) % chats.len()].clone();
+                app.set_chat(next);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct Tui {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl Tui {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self { terminal })
+    }
+
+    fn draw(&mut self, app: &App) -> Result<(), Box<dyn std::error::Error>> {
+        self.terminal.draw(|frame| draw_ui(frame, app))?;
+        Ok(())
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenv().ok();
+
+    let sandbox = SandboxConfig::load().and_then(|config| {
+        ensure_sandbox_ready(&config)?;
+        Ok(config)
+    })?;
+
+    let mut tui = Tui::new()?;
+    let mut app = App::new(sandbox);
+    app.status = "Ready · /chat <name> · /list · /clear · /delete <name> · /credits · Ctrl+C quit"
+        .to_string();
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+
+    while !app.should_quit {
+        while let Ok(event) = event_rx.try_recv() {
+            app.handle_runtime_event(event);
+        }
+
+        tui.draw(&app)?;
+
+        if event::poll(Duration::from_millis(50))?
+            && let CEvent::Key(key) = event::read()?
+        {
+            handle_key_event(&mut app, key, &event_tx);
+        }
+    }
+
+    Ok(())
 }

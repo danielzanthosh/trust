@@ -1,5 +1,7 @@
 # TRUST
 
+[![Hackatime](https://hackatime.hackclub.com/api/v1/badge/U0A4759P0Q0/danielzanthosh/trust)](https://hackati.me/danielzanthosh)
+
 A fast, lightweight AI assistant that runs directly inside the terminal.
 
 Built with Rust 🦀 for speed, safety, and performance.
@@ -59,8 +61,11 @@ Create a `.env` file in the project root:
 API_KEY=your_api_key_here
 BASE_URL=https://ai.hackclub.com/proxy
 MODEL=anthropic/claude-haiku-4.5
+MAX_TOKENS=1024
 ALLOW_DESTRUCTIVE_ACTIONS=false
 ```
+
+`MAX_TOKENS` caps each model response. Set this explicitly if your API provider enforces spending limits or token budgets.
 
 `ALLOW_DESTRUCTIVE_ACTIONS` controls whether destructive commands requested through `run_command` are always blocked or may be presented for explicit approval.
 When set to `false`, destructive commands are blocked.
@@ -91,6 +96,43 @@ Accepted truthy values are `true`, `1`, `yes`, and `on`.
 | ---------- | -------------------- |
 | `/credits` | Show project credits |
 | `/exit`    | Exit the application |
+| `/list`    | List saved chats     |
+| `/clear`   | Clear the current chat |
+| `/chat <name>` | Switch chats |
+| `/delete <name>` | Delete a chat |
+
+## Browser Actions
+
+TRUST handles common browser requests directly, without waiting for the model:
+
+| Request | Action |
+| ------- | ------ |
+| `open chrome` | Opens Chrome |
+| `open youtube` | Opens YouTube in Chrome |
+| `open https://example.com` | Opens the URL in Chrome |
+| `search web for rust tutorials` | Opens a Google search |
+| `search youtube for rust tutorials` | Opens a YouTube search |
+| `search rust tutorials on youtube` | Opens a YouTube search |
+
+## Full Browser Control with Kimi WebBridge
+
+For full webpage control, reading page content, clicking buttons, filling forms, and interacting with sites using your real browser session, install and start Kimi WebBridge first:
+
+1. Install the Kimi WebBridge browser extension.
+2. Install/start the Kimi WebBridge device daemon.
+3. Check that both are connected:
+
+```bash
+~/.kimi-webbridge/bin/kimi-webbridge status
+```
+
+TRUST talks to the local daemon at:
+
+```text
+http://127.0.0.1:10086
+```
+
+If WebBridge is not installed, not running, or the browser extension is disconnected, TRUST will ask you to install/start it before retrying.
 
 ## Project Goals
 

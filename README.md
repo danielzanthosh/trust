@@ -96,6 +96,34 @@ Accepted truthy values are `true`, `1`, `yes`, and `on`.
 | ---------- | -------------------- |
 | `/credits` | Show project credits |
 | `/exit`    | Exit the application |
+| `/list`    | List saved chats     |
+| `/clear`   | Clear the current chat |
+| `/chat <name>` | Switch chats |
+| `/delete <name>` | Delete a chat |
+
+## Browser and Web Control
+
+TRUST does not use keyword shortcuts for browser actions. The AI plans the action, then asks the runtime to execute a tool such as `run_command` or `kimi_webbridge`.
+
+## Full Browser Control with Kimi WebBridge
+
+For full webpage control, reading page content, clicking buttons, filling forms, and interacting with sites using your real browser session, install and start Kimi WebBridge first:
+
+1. Install the Kimi WebBridge browser extension.
+2. Install/start the Kimi WebBridge device daemon.
+3. Check that both are connected:
+
+```bash
+~/.kimi-webbridge/bin/kimi-webbridge status
+```
+
+TRUST talks to the local daemon at:
+
+```text
+http://127.0.0.1:10086
+```
+
+If WebBridge is not installed, not running, or the browser extension is disconnected, TRUST will ask you to install/start it before retrying.
 
 ## Project Goals
 
