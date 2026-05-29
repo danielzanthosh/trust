@@ -1,3 +1,7 @@
+// TRUST
+// Terminal Runtime for Unified Smart Tasks
+// Sandboxed terminal AI runtime with a ratatui/crossterm TUI, streaming chat, tool execution, and permission-gated command execution.
+
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyEvent, KeyModifiers},
     execute,
