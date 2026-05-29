@@ -15,7 +15,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
 };
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -169,6 +172,8 @@ struct App {
     input: String,
     draft_assistant: String,
     status: String,
+    transcript_scroll: u16,
+    auto_scroll: bool,
     should_quit: bool,
     busy: bool,
     pending_approval: Option<PendingApproval>,
@@ -188,6 +193,8 @@ impl App {
             input: String::new(),
             draft_assistant: String::new(),
             status: "Ready".to_string(),
+            transcript_scroll: u16::MAX,
+            auto_scroll: true,
             should_quit: false,
             busy: false,
             pending_approval: None,
@@ -203,34 +210,51 @@ impl App {
         self.pending_approval = None;
         self.busy = false;
         self.status = format!("Switched to chat: {}", self.current_chat);
+        self.scroll_to_bottom();
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.transcript_scroll = u16::MAX;
+        self.auto_scroll = true;
+    }
+
+    fn scroll_up(&mut self, amount: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(amount);
+        self.auto_scroll = false;
+    }
+
+    fn scroll_down(&mut self, amount: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_add(amount);
+        if self.transcript_scroll == u16::MAX {
+            self.auto_scroll = true;
+        }
+    }
+
+    fn push_visible_message(&mut self, role: UiMessageRole, content: String) {
+        if content.trim().is_empty() {
+            return;
+        }
+
+        self.visible_messages.push(UiMessage { role, content });
+        if self.auto_scroll {
+            self.scroll_to_bottom();
+        }
     }
 
     fn add_info_message(&mut self, content: impl Into<String>) {
-        self.visible_messages.push(UiMessage {
-            role: UiMessageRole::Info,
-            content: content.into(),
-        });
+        self.push_visible_message(UiMessageRole::Info, content.into());
     }
 
     fn add_user_message(&mut self, content: String) {
-        self.visible_messages.push(UiMessage {
-            role: UiMessageRole::User,
-            content,
-        });
+        self.push_visible_message(UiMessageRole::User, content);
     }
 
     fn add_tool_message(&mut self, content: String) {
-        self.visible_messages.push(UiMessage {
-            role: UiMessageRole::Tool,
-            content,
-        });
+        self.push_visible_message(UiMessageRole::Tool, content);
     }
 
     fn add_assistant_message(&mut self, content: String) {
-        self.visible_messages.push(UiMessage {
-            role: UiMessageRole::Assistant,
-            content,
-        });
+        self.push_visible_message(UiMessageRole::Assistant, content);
     }
 
     fn handle_runtime_event(&mut self, event: RuntimeEvent) {
@@ -240,7 +264,12 @@ impl App {
                 self.draft_assistant.clear();
                 self.busy = true;
             }
-            RuntimeEvent::AssistantChunk(chunk) => self.draft_assistant.push_str(&chunk),
+            RuntimeEvent::AssistantChunk(chunk) => {
+                self.draft_assistant.push_str(&chunk);
+                if self.auto_scroll {
+                    self.scroll_to_bottom();
+                }
+            }
             RuntimeEvent::CommitAssistant(message) => {
                 self.draft_assistant.clear();
                 self.add_assistant_message(message);
@@ -1580,6 +1609,22 @@ fn build_transcript(app: &App) -> Text<'static> {
     Text::from(lines)
 }
 
+fn transcript_line_count(app: &App) -> usize {
+    app.visible_messages.len().saturating_mul(2)
+        + usize::from(!app.draft_assistant.trim().is_empty())
+}
+
+fn resolved_transcript_scroll(app: &App, viewport_height: u16) -> u16 {
+    let content_lines = transcript_line_count(app) as u16;
+    let max_scroll = content_lines.saturating_sub(viewport_height);
+
+    if app.auto_scroll || app.transcript_scroll == u16::MAX {
+        max_scroll
+    } else {
+        app.transcript_scroll.min(max_scroll)
+    }
+}
+
 fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     let root = frame.area();
     let horizontal = Layout::default()
@@ -1620,33 +1665,64 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     );
     frame.render_widget(chats_list, sidebar_area);
 
+    let transcript_area = vertical[0];
+    let transcript_inner_height = transcript_area.height.saturating_sub(2);
+    let transcript_scroll = resolved_transcript_scroll(app, transcript_inner_height);
+    let transcript_title = format!(
+        "Conversation · ↑/↓ scroll · PgUp/PgDn jump · End latest · {} messages",
+        app.visible_messages.len()
+    );
     let transcript = Paragraph::new(build_transcript(app))
         .block(
             Block::default()
-                .title("Conversation")
+                .title(transcript_title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Green)),
         )
+        .scroll((transcript_scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(transcript, vertical[0]);
+    frame.render_widget(transcript, transcript_area);
 
-    let status = Paragraph::new(app.status.clone()).block(
-        Block::default()
-            .title(format!(
-                "Status · chat={} · busy={} · sandbox={}",
-                app.current_chat,
-                if app.busy { "yes" } else { "no" },
-                display_path(&app.sandbox.workspace)
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
-    );
-    frame.render_widget(status, vertical[1]);
+    let mut scrollbar_state = ScrollbarState::new(transcript_line_count(app))
+        .position(transcript_scroll as usize)
+        .viewport_content_length(transcript_inner_height as usize);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .track_symbol(Some("│"))
+        .thumb_symbol("█")
+        .begin_symbol(Some("▲"))
+        .end_symbol(Some("▼"));
+    frame.render_stateful_widget(scrollbar, transcript_area, &mut scrollbar_state);
 
-    let input = Paragraph::new(app.input.clone())
+    let status_style = if app.busy {
+        Style::default().fg(Color::LightYellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let status = Paragraph::new(app.status.clone())
+        .style(status_style)
         .block(
             Block::default()
-                .title("Input")
+                .title(format!(
+                    "Status · chat={} · busy={} · sandbox={}",
+                    app.current_chat,
+                    if app.busy { "yes" } else { "no" },
+                    display_path(&app.sandbox.workspace)
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+    frame.render_widget(status, vertical[1]);
+
+    let input_title = if app.busy {
+        "Input · waiting for TRUST"
+    } else {
+        "Input · Enter send · Tab chat · Ctrl+C quit"
+    };
+    let input = Paragraph::new(app.input.clone())
+        .style(Style::default().fg(Color::LightCyan))
+        .block(
+            Block::default()
+                .title(input_title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -1806,6 +1882,7 @@ fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSender<RuntimeE
         return;
     }
 
+    app.scroll_to_bottom();
     app.add_user_message(input.clone());
     app.model_history.push(Message {
         role: "user".to_string(),
@@ -1860,6 +1937,15 @@ fn handle_key_event(app: &mut App, key: KeyEvent, event_tx: &mpsc::UnboundedSend
             app.should_quit = true;
         }
         KeyCode::Enter => submit_current_input(app, event_tx),
+        KeyCode::Up => app.scroll_up(1),
+        KeyCode::Down => app.scroll_down(1),
+        KeyCode::PageUp => app.scroll_up(8),
+        KeyCode::PageDown => app.scroll_down(8),
+        KeyCode::Home => {
+            app.transcript_scroll = 0;
+            app.auto_scroll = false;
+        }
+        KeyCode::End => app.scroll_to_bottom(),
         KeyCode::Backspace => {
             app.input.pop();
         }
