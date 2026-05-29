@@ -2,3 +2,4 @@
 .env
 .json
 memory/*.json
+/sandbox
