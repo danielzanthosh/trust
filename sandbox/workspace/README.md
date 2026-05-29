@@ -101,18 +101,9 @@ Accepted truthy values are `true`, `1`, `yes`, and `on`.
 | `/chat <name>` | Switch chats |
 | `/delete <name>` | Delete a chat |
 
-## Browser Actions
+## Browser and Web Control
 
-TRUST handles common browser requests directly, without waiting for the model:
-
-| Request | Action |
-| ------- | ------ |
-| `open chrome` | Opens Chrome |
-| `open youtube` | Opens YouTube in Chrome |
-| `open https://example.com` | Opens the URL in Chrome |
-| `search web for rust tutorials` | Opens a Google search |
-| `search youtube for rust tutorials` | Opens a YouTube search |
-| `search rust tutorials on youtube` | Opens a YouTube search |
+TRUST does not use keyword shortcuts for browser actions. The AI plans the action, then asks the runtime to execute a tool such as `run_command` or `kimi_webbridge`.
 
 ## Full Browser Control with Kimi WebBridge
 

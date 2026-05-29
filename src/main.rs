@@ -1710,10 +1710,10 @@ async fn run_tool(
                 Err(error) => return error,
             };
 
-            if let Some(parent) = resolved_path.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    return format!("Failed to create parent directory for {}: {}", path, e);
-                }
+            if let Some(parent) = resolved_path.parent()
+                && let Err(e) = fs::create_dir_all(parent)
+            {
+                return format!("Failed to create parent directory for {}: {}", path, e);
             }
 
             let content = tool_call.args.content.unwrap_or_default();
@@ -2554,7 +2554,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ensure_sandbox_ready(&config)?;
             Ok(config)
         })
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        .map_err(io::Error::other)?;
 
     let mut tui = Tui::new()?;
     let mut app = App::new(sandbox);

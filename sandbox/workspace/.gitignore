@@ -3,3 +3,12 @@
 .json
 memory/*.json
 /sandbox
+
+testsprite_tests\tmp\config.json
+list_mcp_tools.js
+check_account.js
+testsprite_tests/tmp/mcp.log
+run_testsprite_scan.js
+test_mcp.js
+testsprite_tests/tmp/config.json
+testsprite_tests/tmp/prd_files/README.md
