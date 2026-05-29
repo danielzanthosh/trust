@@ -1,14 +1,28 @@
-/target
-.env
-.json
-memory/*.json
-/sandbox
+# Rust build output
+/target/
 
-testsprite_tests\tmp\config.json
-list_mcp_tools.js
-check_account.js
-testsprite_tests/tmp/mcp.log
-run_testsprite_scan.js
-test_mcp.js
-testsprite_tests/tmp/config.json
-testsprite_tests/tmp/prd_files/README.md
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime state
+/memory/*.json
+/sandbox/
+/permissions/
+
+# TestSprite/generated test artifacts
+/testsprite_tests/
+
+# Local experiment scripts
+/check_account.js
+/list_mcp_tools.js
+/run_testsprite_scan.js
+/test_mcp.js
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db

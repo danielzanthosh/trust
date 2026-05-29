@@ -507,6 +507,17 @@ fn copy_project_tree(source: &Path, destination: &Path, project_root: &Path) -> 
     Ok(())
 }
 
+fn seed_sandbox_workspace() -> bool {
+    env::var("SEED_SANDBOX_WORKSPACE")
+        .map(|value| {
+            matches!(
+                value.trim().to_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn ensure_sandbox_ready(config: &SandboxConfig) -> Result<(), String> {
     fs::create_dir_all(&config.root).map_err(|e| {
         format!(
@@ -537,21 +548,23 @@ fn ensure_sandbox_ready(config: &SandboxConfig) -> Result<(), String> {
         )
     })?;
 
-    let workspace_is_empty = fs::read_dir(&config.workspace)
-        .map_err(|e| {
-            format!(
-                "Failed to inspect sandbox workspace {}: {}",
-                display_path(&config.workspace),
-                e
-            )
-        })?
-        .next()
-        .is_none();
+    if seed_sandbox_workspace() {
+        let workspace_is_empty = fs::read_dir(&config.workspace)
+            .map_err(|e| {
+                format!(
+                    "Failed to inspect sandbox workspace {}: {}",
+                    display_path(&config.workspace),
+                    e
+                )
+            })?
+            .next()
+            .is_none();
 
-    if workspace_is_empty {
-        let project_root = env::current_dir()
-            .map_err(|e| format!("Failed to resolve current project directory: {}", e))?;
-        copy_project_tree(&project_root, &config.workspace, &project_root)?;
+        if workspace_is_empty {
+            let project_root = env::current_dir()
+                .map_err(|e| format!("Failed to resolve current project directory: {}", e))?;
+            copy_project_tree(&project_root, &config.workspace, &project_root)?;
+        }
     }
 
     Ok(())
@@ -1867,7 +1880,8 @@ You are a helpful terminal AI with safe agentic control.
 You are the planner: decide which tool or command should be used for each user request.
 Use tools only when the user clearly asks for an action on the computer, files, apps, browser, web pages, or sandbox.
 For normal conversation, answer normally in plain text and do not call tools. Do not wrap normal replies in JSON.
-If the user asks you to open, launch, navigate to, go to, search on, or interact with an app/website/computer, that is not normal conversation: you MUST call an appropriate tool instead of giving instructions.
+Do not use raw Markdown formatting for normal replies: avoid ### headings, **bold markers**, and long numbered instruction dumps. The TUI adds styling.
+If the user asks you to open, launch, navigate to, go to, search on, click, fill, or interact with an app/website/computer, that is not normal conversation: you MUST call an appropriate tool instead of giving instructions.
 You may use multiple tools across multiple steps in a single turn.
 When using a tool, reply ONLY with JSON and no extra text.
 After a tool runs, you will receive a follow-up message that starts with "Tool result from TRUST runtime:".
@@ -1980,9 +1994,10 @@ Command planning rules:
 - Understand the user's intent, generate PowerShell, rely on the runtime's destructive-command detector, request execution through run_command, then explain the result.
 - If the user asks to open, launch, or start an installed app, browser, Chrome, Edge, terminal, file explorer, or desktop program, immediately call run_command with PowerShell Start-Process. Do not answer with instructions. Do not use Kimi WebBridge for launching apps.
 - If the user asks to open, go to, or navigate to a website/URL in the normal browser, immediately call run_command with Start-Process chrome '<url>' or Start-Process '<url>'. Preserve the exact requested URL and do not invent a different URL.
+- If the user gives a multi-step browser task like "open Chrome, go to a site, click something, fill a form", do it as tool steps: first run_command to open Chrome/site, then use Kimi WebBridge snapshot/click/fill for page interaction. Do not respond with a written tutorial.
 - If the user asks to search the web from the browser, call run_command with a browser URL for the search query.
 - Use Kimi WebBridge only when the user asks to inspect, read, click, type, fill, search inside, configure, buy, check out, or otherwise interact with webpage contents after a page is open.
-- You may help navigate shopping or checkout pages, but do not complete purchases, submit payment, or place orders.
+- You may fill harmless sample data when explicitly asked, but do not enter real personal/payment credentials. Do not complete purchases, submit payment, or place orders.
 - For delayed or scheduled tasks, generate a complete PowerShell script with variables, loops, Start-Sleep, process tracking with -PassThru where possible, and cleanup after completion.
 - For multi-step app/process tasks, prefer tracking process objects instead of broad process kills. Use Stop-Process only for processes you started when possible.
 - If permission is required, the runtime will show the generated command/script before execution.
@@ -1997,8 +2012,9 @@ Safety rules:
 - Destructive commands targeting system folders, Windows/System32, boot files, registry hives, entire drives, security tools, or user profiles may be blocked unless ALLOW_DESTRUCTIVE_ACTIONS=true and the user explicitly approves them.
 - If the runtime blocks a command, briefly explain that the runtime blocked it and suggest a safer alternative.
 - Never claim a command ran unless the runtime returns a tool result confirming it ran.
-- Never pretend to save files, read files, list directories, open apps, or run commands. Use a tool when available.
+- Never pretend to save files, read files, list directories, open apps, browse websites, click elements, fill fields, or run commands. Use a tool when available.
 - If a tool is useful, prefer actually using it over just describing what would happen.
+- If a requested action needs a tool but the tool is unavailable or fails, say that clearly and stop; do not replace the action with a tutorial.
 - Only use JSON when calling tools.
 "#
     .to_string()
@@ -2119,6 +2135,132 @@ fn ui_messages_from_history(history: &[Message]) -> Vec<UiMessage> {
         .collect()
 }
 
+fn spinner() -> &'static str {
+    let frame = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 140) % 8)
+        .unwrap_or(0);
+
+    match frame {
+        0 => "⠋",
+        1 => "⠙",
+        2 => "⠹",
+        3 => "⠸",
+        4 => "⠼",
+        5 => "⠴",
+        6 => "⠦",
+        _ => "⠧",
+    }
+}
+
+fn styled_inline_spans(content: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = content;
+
+    while !rest.is_empty() {
+        if let Some(after_marker) = rest.strip_prefix("**")
+            && let Some(end) = after_marker.find("**")
+        {
+            spans.push(Span::styled(
+                after_marker[..end].to_string(),
+                base_style.add_modifier(Modifier::BOLD),
+            ));
+            rest = &after_marker[end + 2..];
+            continue;
+        }
+
+        if let Some(after_marker) = rest.strip_prefix('*')
+            && let Some(end) = after_marker.find('*')
+        {
+            spans.push(Span::styled(
+                after_marker[..end].to_string(),
+                base_style.add_modifier(Modifier::ITALIC),
+            ));
+            rest = &after_marker[end + 1..];
+            continue;
+        }
+
+        if let Some(after_marker) = rest.strip_prefix('`')
+            && let Some(end) = after_marker.find('`')
+        {
+            spans.push(Span::styled(
+                after_marker[..end].to_string(),
+                Style::default().fg(Color::LightMagenta),
+            ));
+            rest = &after_marker[end + 1..];
+            continue;
+        }
+
+        let next_marker = rest
+            .char_indices()
+            .skip(1)
+            .find_map(|(index, ch)| matches!(ch, '*' | '`').then_some(index))
+            .unwrap_or(rest.len());
+        spans.push(Span::styled(rest[..next_marker].to_string(), base_style));
+        rest = &rest[next_marker..];
+    }
+
+    spans
+}
+
+fn styled_message_lines(label: &str, color: Color, content: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let label_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+
+    for (index, raw_line) in content.lines().enumerate() {
+        let trimmed = raw_line.trim_start();
+        let mut line_spans = Vec::new();
+
+        if index == 0 {
+            line_spans.push(Span::styled(format!("{}: ", label), label_style));
+        } else {
+            line_spans.push(Span::raw("  "));
+        }
+
+        if let Some(heading) = trimmed.strip_prefix("### ") {
+            line_spans.push(Span::styled(
+                heading.to_string(),
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(heading) = trimmed.strip_prefix("## ") {
+            line_spans.push(Span::styled(
+                heading.to_string(),
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(heading) = trimmed.strip_prefix("# ") {
+            line_spans.push(Span::styled(
+                heading.to_string(),
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            line_spans.push(Span::styled("• ", Style::default().fg(Color::LightCyan)));
+            line_spans.extend(styled_inline_spans(item, Style::default()));
+        } else {
+            line_spans.extend(styled_inline_spans(raw_line, Style::default()));
+        }
+
+        lines.push(Line::from(line_spans));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            format!("{}: ", label),
+            label_style,
+        )]));
+    }
+
+    lines
+}
+
 fn build_transcript(app: &App) -> Text<'static> {
     let mut lines = Vec::new();
 
@@ -2130,17 +2272,17 @@ fn build_transcript(app: &App) -> Text<'static> {
             UiMessageRole::Info => ("Info", Color::Yellow),
         };
 
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{}: ", label),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(message.content.clone()),
-        ]));
+        lines.extend(styled_message_lines(label, color, &message.content));
         lines.push(Line::raw(""));
     }
 
     if !app.draft_assistant.is_empty() {
+        lines.extend(styled_message_lines(
+            "TRUST",
+            Color::Green,
+            &app.draft_assistant,
+        ));
+    } else if app.busy {
         lines.push(Line::from(vec![
             Span::styled(
                 "TRUST: ",
@@ -2148,7 +2290,10 @@ fn build_transcript(app: &App) -> Text<'static> {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(app.draft_assistant.clone()),
+            Span::styled(
+                format!("{} thinking…", spinner()),
+                Style::default().fg(Color::LightGreen),
+            ),
         ]));
     }
 
@@ -2186,7 +2331,7 @@ fn transcript_line_count(app: &App, viewport_width: u16) -> usize {
         .sum::<usize>();
 
     let draft_lines = if app.draft_assistant.trim().is_empty() {
-        0
+        usize::from(app.busy)
     } else {
         wrapped_line_count(
             &app.draft_assistant,
@@ -2254,10 +2399,18 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     let transcript_inner_width = transcript_area.width.saturating_sub(2);
     let transcript_scroll =
         resolved_transcript_scroll(app, transcript_inner_height, transcript_inner_width);
-    let transcript_title = format!(
-        "Conversation · ↑/↓ scroll · PgUp/PgDn jump · End newest · {} messages",
-        app.visible_messages.len()
-    );
+    let transcript_title = if app.busy {
+        format!(
+            "Conversation · {} TRUST working · wheel/↑/↓ scroll · End newest · {} messages",
+            spinner(),
+            app.visible_messages.len()
+        )
+    } else {
+        format!(
+            "Conversation · wheel/↑/↓ scroll · PgUp/PgDn jump · End newest · {} messages",
+            app.visible_messages.len()
+        )
+    };
     let transcript = Paragraph::new(build_transcript(app))
         .block(
             Block::default()

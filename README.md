@@ -2,54 +2,26 @@
 
 [![Hackatime](https://hackatime.hackclub.com/api/v1/badge/U0A4759P0Q0/danielzanthosh/trust)](https://hackati.me/danielzanthosh)
 
-A fast, lightweight AI assistant that runs directly inside the terminal.
+TRUST is a terminal AI assistant built in Rust. It combines a TUI chat interface, streaming model responses, persistent named chats, sandboxed file access, permission-gated command execution, and optional browser control through Kimi WebBridge.
 
-Built with Rust 🦀 for speed, safety, and performance.
 ## Features
 
-* OpenAI-compatible API support
-* Anthropic-compatible API support
-* Custom API base URL
-* Chat history memory
-* Terminal-based interface
-* Fast async networking
-* Colored terminal output
-* Environment variable configuration
-* Memory-safe architecture powered by Rust
+- TUI chat interface powered by `ratatui` and `crossterm`
+- Streaming assistant responses
+- Named chat history with local commands
+- OpenAI-compatible and Anthropic-compatible API support
+- Custom API base URL support
+- Sandboxed runtime directories for tool actions
+- PowerShell command execution with approval prompts
+- Destructive command blocking and command logs
+- Optional browser/page control through Kimi WebBridge
+- Styled terminal rendering for headings, bullets, inline code, bold, and italic text
 
-## Planned Features
-
-* Infinite memory system
-* Streaming responses
-* Markdown rendering
-* Syntax highlighting
-* TUI interface
-* Multiple provider support
-* Local AI support with Ollama
-* Slash commands
-* Persistent conversation storage
-
-## Tech Stack
-
-* Rust
-* Tokio
-* Reqwest
-* Serde
-* dotenvy
-* colored
-
-## Installation
-
-Clone the repository:
+## Install and run
 
 ```bash
 git clone https://github.com/danielzanthosh/trust.git
 cd trust
-```
-
-Install dependencies and run:
-
-```bash
 cargo run
 ```
 
@@ -63,102 +35,80 @@ BASE_URL=https://ai.hackclub.com/proxy
 MODEL=anthropic/claude-haiku-4.5
 MAX_TOKENS=1024
 ALLOW_DESTRUCTIVE_ACTIONS=false
+SANDBOX_COMMAND_TIMEOUT_MS=10000
 ```
 
-`MAX_TOKENS` caps each model response. Set this explicitly if your API provider enforces spending limits or token budgets.
+`BASE_URL` can point to an OpenAI-compatible or Anthropic-compatible API. TRUST detects the provider shape and builds the request accordingly.
 
-`ALLOW_DESTRUCTIVE_ACTIONS` controls whether destructive commands requested through `run_command` are always blocked or may be presented for explicit approval.
-When set to `false`, destructive commands are blocked.
-When set to `true`, destructive commands still never auto-run: the runtime will prompt the user and only execute them when the user chooses `Allow once`.
+## Local commands
 
-## Command Permissions
+| Command | Description |
+| --- | --- |
+| `/credits` | Show project credits |
+| `/exit`, `/quit` | Exit the app |
+| `/list` | List saved chats |
+| `/clear` | Clear the current chat |
+| `/chat <name>` | Switch to a named chat |
+| `/delete <name>` | Delete a saved chat |
 
-TRUST supports runtime-gated command execution through the `run_command` tool.
+## Runtime safety
 
-- Commands run inside `sandbox/workspace`
-- `stdin` is disabled
-- `stdout` and `stderr` are captured
-- the timeout comes from `SANDBOX_COMMAND_TIMEOUT_MS`
-- destructive commands are never persisted to `permissions/allowed_commands.json`
-- non-destructive commands may be saved with `Allow always`
+TRUST can ask the runtime to execute tools, but the runtime enforces safety rules.
 
-To enable destructive command approvals, add this to `.env`:
+- File tools are restricted to `sandbox/workspace`, `sandbox/outputs`, and `sandbox/temp`.
+- Shell commands run from `sandbox/workspace` with stdin disabled.
+- Risky commands require approval.
+- Destructive commands are blocked by default.
+- Destructive commands are never saved as always-allowed commands.
+- Command decisions and results are logged under `permissions/`.
+
+The sandbox workspace starts empty by default. If you want TRUST to seed the sandbox with a copy of the project on startup, set:
 
 ```env
-ALLOW_DESTRUCTIVE_ACTIONS=true
+SEED_SANDBOX_WORKSPACE=true
 ```
 
-Accepted truthy values are `true`, `1`, `yes`, and `on`.
+## Browser control
 
-## Commands
+For opening apps or URLs, TRUST uses PowerShell through `run_command`, for example `Start-Process chrome`.
 
-| Command    | Description          |
-| ---------- | -------------------- |
-| `/credits` | Show project credits |
-| `/exit`    | Exit the application |
-| `/list`    | List saved chats     |
-| `/clear`   | Clear the current chat |
-| `/chat <name>` | Switch chats |
-| `/delete <name>` | Delete a chat |
-
-## Browser and Web Control
-
-TRUST does not use keyword shortcuts for browser actions. The AI plans the action, then asks the runtime to execute a tool such as `run_command` or `kimi_webbridge`.
-
-## Full Browser Control with Kimi WebBridge
-
-For full webpage control, reading page content, clicking buttons, filling forms, and interacting with sites using your real browser session, install and start Kimi WebBridge first:
-
-1. Install the Kimi WebBridge browser extension.
-2. Install/start the Kimi WebBridge device daemon.
-3. Check that both are connected:
-
-```bash
-~/.kimi-webbridge/bin/kimi-webbridge status
-```
-
-TRUST talks to the local daemon at:
+For reading, clicking, typing, filling forms, or interacting with webpage contents, TRUST uses Kimi WebBridge when available. WebBridge must be installed and connected separately, and TRUST talks to the local daemon at:
 
 ```text
 http://127.0.0.1:10086
 ```
 
-If WebBridge is not installed, not running, or the browser extension is disconnected, TRUST will ask you to install/start it before retrying.
+TRUST may help navigate or fill harmless sample data, but it should not submit payments, place orders, or enter real credentials.
 
-## Project Goals
+## Development
 
-TRUST aims to be:
+Useful checks:
 
-* Fast
-* Minimal
-* Extensible
-* Cross-platform
-* Developer-friendly
-* Memory-safe
+```bash
+cargo fmt --check
+cargo clippy
+cargo test
+```
 
-The long-term goal is to create a fully featured AI assistant experience entirely inside the terminal.
+Current note: the crate builds and the test harness runs, but more real Rust unit tests are still needed.
 
-## Why Rust?
+## Tech stack
 
-Rust provides:
+- Rust
+- Tokio
+- Reqwest
+- Serde / serde_json
+- dotenvy
+- ratatui
+- crossterm
 
-* Memory safety
-* Excellent performance
-* Strong type safety
-* Great async support
-* Cross-platform compatibility
+## Status
 
-Perfect for building reliable terminal applications and AI tooling.
-
-## Current Status
-
-🚧 Active Development
-
-This project is currently in early development.
+Active development. Expect rough edges while the TUI, runtime tools, and browser-control workflows evolve.
 
 ## License
 
-MIT License
+MIT
 
 ## Author
 
