@@ -1,6 +1,6 @@
 # TRUST
 
-[![Hackatime](https://hackatime.hackclub.com/api/v1/badge/U0A4759P0Q0/danielzanthosh/trust)](https://hackatime.hackclub.com)
+[![Hackatime](https://hackatime.hackclub.com/api/v1/badge/U0A4759P0Q0/danielzanthosh/trust)](https://hackati.me/danielzanthosh)
 
 A fast, lightweight AI assistant that runs directly inside the terminal.
 
