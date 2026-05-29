@@ -3,7 +3,7 @@
 // Sandboxed terminal AI runtime with a ratatui/crossterm TUI, streaming chat, tool execution, and permission-gated command execution.
 
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -1829,6 +1829,10 @@ fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSender<RuntimeE
 }
 
 fn handle_key_event(app: &mut App, key: KeyEvent, event_tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+
     if let Some(pending) = app.pending_approval.take() {
         let choice = match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => Some(PermissionChoice::AllowOnce),
@@ -1842,8 +1846,9 @@ fn handle_key_event(app: &mut App, key: KeyEvent, event_tx: &mpsc::UnboundedSend
         };
 
         if let Some(choice) = choice {
+            let command = pending.command.clone();
             let _ = pending.responder.send(choice);
-            app.status = format!("Resolved approval for: {}", pending.command);
+            app.status = format!("Resolved approval for: {}", command);
         } else {
             app.pending_approval = Some(pending);
         }
