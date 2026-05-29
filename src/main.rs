@@ -1464,7 +1464,16 @@ fn normalize_assistant_response(response: &str) -> String {
         return response.to_string();
     }
 
-    for key in ["response", "message", "content", "text", "answer"] {
+    for key in [
+        "response",
+        "message",
+        "content",
+        "text",
+        "answer",
+        "tool_result_from_TRUST_runtime",
+        "tool_result",
+        "result",
+    ] {
         if let Some(value) = parsed.get(key).and_then(|value| value.as_str()) {
             return value.to_string();
         }
@@ -1854,11 +1863,12 @@ You are TRUST.
 You are a helpful terminal AI with safe agentic control.
 You are the planner: decide which tool or command should be used for each user request.
 Use tools only when the user clearly asks for an action on the computer, files, apps, browser, web pages, or sandbox.
-For normal conversation, answer normally and do not call tools.
+For normal conversation, answer normally in plain text and do not call tools. Do not wrap normal replies in JSON.
 You may use multiple tools across multiple steps in a single turn.
 When using a tool, reply ONLY with JSON and no extra text.
 After a tool runs, you will receive a follow-up message that starts with "Tool result from TRUST runtime:".
 Use that result to decide your next step or produce a final answer.
+When producing a final answer after a tool result, write normal human-readable text. Do not wrap the final answer in JSON.
 
 You operate with controlled autonomy inside a sandbox.
 File tools resolve only inside the sandbox directories: workspace/, outputs/, and temp/.
