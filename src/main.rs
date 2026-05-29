@@ -747,7 +747,9 @@ fn command_targets_entire_drive(normalized_command: &str) -> bool {
             " c:/ -force",
             " c:\\* -force",
             " c:/* -force",
-            " / ",
+            " remove-item / -recurse",
+            " rm / -rf",
+            " rm -rf /",
         ],
     )
 }
@@ -1307,13 +1309,32 @@ fn build_request_body(model: &str, history: &[Message], provider: Provider) -> s
 }
 
 fn extract_stream_text(data: &str) -> String {
-    let parsed: serde_json::Value = serde_json::from_str(data).unwrap_or_default();
+    let parsed: serde_json::Value = match serde_json::from_str(data) {
+        Ok(value) => value,
+        Err(_) => return String::new(),
+    };
 
+    // OpenAI-compatible chat completions streaming
     if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
         return content.to_string();
     }
 
+    // Some OpenAI-compatible providers stream plain text here.
+    if let Some(content) = parsed["choices"][0]["text"].as_str() {
+        return content.to_string();
+    }
+
+    // Anthropic Messages API streaming: content_block_delta -> delta.text
     if let Some(content) = parsed["delta"]["text"].as_str() {
+        return content.to_string();
+    }
+
+    // A few local/proxy APIs return a direct text/content field.
+    if let Some(content) = parsed["text"].as_str() {
+        return content.to_string();
+    }
+
+    if let Some(content) = parsed["content"].as_str() {
         return content.to_string();
     }
 
@@ -1367,31 +1388,52 @@ async fn request_model_reply(
 
             let mut stream = res.bytes_stream();
             let mut full_message = String::new();
+            let mut sse_buffer = String::new();
             let _ = event_tx.send(RuntimeEvent::StartAssistant);
 
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(chunk) => {
-                        let text = String::from_utf8_lossy(&chunk);
+                        sse_buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                        for line in text.lines() {
-                            if line.starts_with("data: ") {
-                                let data = line.replace("data: ", "");
+                        while let Some(newline_index) = sse_buffer.find('\n') {
+                            let mut line = sse_buffer[..newline_index].to_string();
+                            sse_buffer.drain(..=newline_index);
 
-                                if data == "[DONE]" {
-                                    break;
-                                }
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
 
-                                let content = extract_stream_text(&data);
-                                if !content.is_empty() {
-                                    full_message.push_str(&content);
-                                    let _ = event_tx.send(RuntimeEvent::AssistantChunk(content));
-                                }
+                            let Some(data) = line.strip_prefix("data:") else {
+                                continue;
+                            };
+
+                            let data = data.trim();
+                            if data == "[DONE]" {
+                                break;
+                            }
+
+                            let content = extract_stream_text(data);
+                            if !content.is_empty() {
+                                full_message.push_str(&content);
+                                let _ = event_tx.send(RuntimeEvent::AssistantChunk(content));
                             }
                         }
                     }
                     Err(error) => {
                         return Err(format!("Stream error: {}", error));
+                    }
+                }
+            }
+
+            // Some providers send a final data line without a trailing newline.
+            if let Some(data) = sse_buffer.trim().strip_prefix("data:") {
+                let data = data.trim();
+                if data != "[DONE]" {
+                    let content = extract_stream_text(data);
+                    if !content.is_empty() {
+                        full_message.push_str(&content);
+                        let _ = event_tx.send(RuntimeEvent::AssistantChunk(content));
                     }
                 }
             }
@@ -1482,9 +1524,13 @@ async fn run_sandboxed_command(
             allowed_command.args,
             allowed_command.display,
         ),
-        PermissionChoice::AllowAlways | PermissionChoice::Decline => {
-            format!("User declined command: {}", allowed_command.display)
+        PermissionChoice::AllowAlways => {
+            format!(
+                "Allow always is not available for sandboxed commands: {}",
+                allowed_command.display
+            )
         }
+        PermissionChoice::Decline => format!("User declined command: {}", allowed_command.display),
     }
 }
 
@@ -1664,10 +1710,10 @@ async fn run_tool(
                 Err(error) => return error,
             };
 
-            if let Some(parent) = resolved_path.parent()
-                && let Err(e) = fs::create_dir_all(parent)
-            {
-                return format!("Failed to create parent directory for {}: {}", path, e);
+            if let Some(parent) = resolved_path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    return format!("Failed to create parent directory for {}: {}", path, e);
+                }
             }
 
             let content = tool_call.args.content.unwrap_or_default();
@@ -2219,18 +2265,32 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         frame.render_widget(Clear, popup);
 
         let mut lines = vec![
-            Line::from(vec![Span::styled(
-                format!("{}: {}", pending.title, pending.command),
+            Line::from(Span::styled(
+                pending.title.clone(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )]),
+            )),
             Line::raw(""),
             Line::from(vec![
                 Span::styled("Risk: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(pending.risk_label.clone()),
             ]),
             Line::raw(""),
-            Line::raw("[A] Allow once"),
+            Line::from(Span::styled(
+                "Command:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
         ];
+
+        for command_line in pending.command.lines().take(8) {
+            lines.push(Line::raw(command_line.to_string()));
+        }
+
+        if pending.command.lines().count() > 8 {
+            lines.push(Line::raw("..."));
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(Line::raw("[A] Allow once"));
 
         if pending.allow_always {
             lines.push(Line::raw("[L] Allow always"));
@@ -2489,10 +2549,12 @@ impl Drop for Tui {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
-    let sandbox = SandboxConfig::load().and_then(|config| {
-        ensure_sandbox_ready(&config)?;
-        Ok(config)
-    })?;
+    let sandbox = SandboxConfig::load()
+        .and_then(|config| {
+            ensure_sandbox_ready(&config)?;
+            Ok(config)
+        })
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
 
     let mut tui = Tui::new()?;
     let mut app = App::new(sandbox);
