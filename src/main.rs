@@ -8,7 +8,10 @@ use crossterm::{
         KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        size as terminal_size,
+    },
 };
 use dotenvy::dotenv;
 use futures_util::StreamExt;
@@ -1864,11 +1867,13 @@ You are a helpful terminal AI with safe agentic control.
 You are the planner: decide which tool or command should be used for each user request.
 Use tools only when the user clearly asks for an action on the computer, files, apps, browser, web pages, or sandbox.
 For normal conversation, answer normally in plain text and do not call tools. Do not wrap normal replies in JSON.
+If the user asks you to open, launch, navigate to, go to, search on, or interact with an app/website/computer, that is not normal conversation: you MUST call an appropriate tool instead of giving instructions.
 You may use multiple tools across multiple steps in a single turn.
 When using a tool, reply ONLY with JSON and no extra text.
 After a tool runs, you will receive a follow-up message that starts with "Tool result from TRUST runtime:".
 Use that result to decide your next step or produce a final answer.
 When producing a final answer after a tool result, write normal human-readable text. Do not wrap the final answer in JSON.
+Never write fake tool results such as "Tool result from TRUST runtime" or "None required" yourself. Only the runtime provides tool results.
 
 You operate with controlled autonomy inside a sandbox.
 File tools resolve only inside the sandbox directories: workspace/, outputs/, and temp/.
@@ -1973,9 +1978,11 @@ Allowed tools:
 
 Command planning rules:
 - Understand the user's intent, generate PowerShell, rely on the runtime's destructive-command detector, request execution through run_command, then explain the result.
-- If the user asks to open or launch an installed app, browser, Chrome, Edge, terminal, file explorer, or desktop program, use run_command with PowerShell Start-Process. Do not use Kimi WebBridge for launching apps.
-- If the user asks to open a URL in Chrome or a browser, use run_command with Start-Process chrome '<url>' or Start-Process '<url>'. Do not invent a different URL.
-- Use Kimi WebBridge only when the user asks to inspect, read, click, type, fill, search inside, configure, buy, check out, or otherwise interact with webpage contents.
+- If the user asks to open, launch, or start an installed app, browser, Chrome, Edge, terminal, file explorer, or desktop program, immediately call run_command with PowerShell Start-Process. Do not answer with instructions. Do not use Kimi WebBridge for launching apps.
+- If the user asks to open, go to, or navigate to a website/URL in the normal browser, immediately call run_command with Start-Process chrome '<url>' or Start-Process '<url>'. Preserve the exact requested URL and do not invent a different URL.
+- If the user asks to search the web from the browser, call run_command with a browser URL for the search query.
+- Use Kimi WebBridge only when the user asks to inspect, read, click, type, fill, search inside, configure, buy, check out, or otherwise interact with webpage contents after a page is open.
+- You may help navigate shopping or checkout pages, but do not complete purchases, submit payment, or place orders.
 - For delayed or scheduled tasks, generate a complete PowerShell script with variables, loops, Start-Sleep, process tracking with -PassThru where possible, and cleanup after completion.
 - For multi-step app/process tasks, prefer tracking process objects instead of broad process kills. Use Stop-Process only for processes you started when possible.
 - If permission is required, the runtime will show the generated command/script before execution.
@@ -2500,10 +2507,55 @@ fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSender<RuntimeE
     });
 }
 
+fn transcript_viewport_size() -> Option<(u16, u16)> {
+    let (terminal_width, terminal_height) = terminal_size().ok()?;
+    let sidebar_width = 24;
+    let transcript_border = 2;
+    let bottom_panels_height = 7;
+
+    Some((
+        terminal_width
+            .saturating_sub(sidebar_width)
+            .saturating_sub(transcript_border),
+        terminal_height
+            .saturating_sub(bottom_panels_height)
+            .saturating_sub(transcript_border),
+    ))
+}
+
+fn scroll_down_visible(app: &mut App, amount: u16) {
+    app.scroll_down(amount);
+
+    let Some((width, height)) = transcript_viewport_size() else {
+        return;
+    };
+
+    let content_lines = transcript_line_count(app, width).min(usize::from(u16::MAX)) as u16;
+    let max_scroll = content_lines.saturating_sub(height);
+
+    if app.transcript_scroll >= max_scroll {
+        app.scroll_to_bottom();
+    }
+}
+
 fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
+    let Ok((terminal_width, terminal_height)) = terminal_size() else {
+        return;
+    };
+
+    let sidebar_width = 24;
+    let bottom_panels_height = 7;
+    let in_transcript = mouse.column >= sidebar_width
+        && mouse.column < terminal_width
+        && mouse.row < terminal_height.saturating_sub(bottom_panels_height);
+
+    if !in_transcript {
+        return;
+    }
+
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_up(3),
-        MouseEventKind::ScrollDown => app.scroll_down(3),
+        MouseEventKind::ScrollUp => app.scroll_up(1),
+        MouseEventKind::ScrollDown => scroll_down_visible(app, 1),
         _ => {}
     }
 }
@@ -2541,9 +2593,9 @@ fn handle_key_event(app: &mut App, key: KeyEvent, event_tx: &mpsc::UnboundedSend
         }
         KeyCode::Enter => submit_current_input(app, event_tx),
         KeyCode::Up => app.scroll_up(1),
-        KeyCode::Down => app.scroll_down(1),
+        KeyCode::Down => scroll_down_visible(app, 1),
         KeyCode::PageUp => app.scroll_up(8),
-        KeyCode::PageDown => app.scroll_down(8),
+        KeyCode::PageDown => scroll_down_visible(app, 8),
         KeyCode::Home => {
             app.transcript_scroll = 0;
             app.auto_scroll = false;
