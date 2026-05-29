@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, oneshot};
 const MAX_AGENT_STEPS: usize = 5;
 const DEFAULT_SANDBOX_DIR: &str = "sandbox/workspace";
 const DEFAULT_SANDBOX_COMMAND_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_TOKENS: u64 = 1024;
 const TOOL_RESULT_PREFIX: &str = "Tool result from TRUST runtime: ";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -939,12 +940,23 @@ fn build_headers(api_key: &str, provider: Provider) -> Result<HeaderMap, String>
     Ok(headers)
 }
 
+fn max_tokens() -> u64 {
+    env::var("MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
 fn build_request_body(model: &str, history: &[Message], provider: Provider) -> serde_json::Value {
+    let max_tokens = max_tokens();
+
     match provider {
         Provider::OpenAiCompatible => json!({
             "model": model,
             "messages": history,
-            "stream": true
+            "stream": true,
+            "max_tokens": max_tokens
         }),
         Provider::AnthropicCompatible => {
             let system = history
@@ -975,7 +987,7 @@ fn build_request_body(model: &str, history: &[Message], provider: Provider) -> s
                 "system": system,
                 "messages": messages,
                 "stream": true,
-                "max_tokens": 4096
+                "max_tokens": max_tokens
             })
         }
     }
@@ -1035,7 +1047,7 @@ async fn request_model_reply(
                     .await
                     .unwrap_or_else(|_| "<failed to read error response body>".to_string());
                 return Err(format!(
-                    "API error status: {}\nAPI error body: {}\nRequest URL: {}\nDetected Provider: {:?}",
+                    "API error status: {}\n\nAPI error body:\n{}\n\nRequest URL:\n{}\n\nDetected provider: {:?}",
                     status, error_body, url, provider
                 ));
             }

@@ -61,8 +61,11 @@ Create a `.env` file in the project root:
 API_KEY=your_api_key_here
 BASE_URL=https://ai.hackclub.com/proxy
 MODEL=anthropic/claude-haiku-4.5
+MAX_TOKENS=1024
 ALLOW_DESTRUCTIVE_ACTIONS=false
 ```
+
+`MAX_TOKENS` caps each model response. Set this explicitly if your API provider enforces spending limits or token budgets.
 
 `ALLOW_DESTRUCTIVE_ACTIONS` controls whether destructive commands requested through `run_command` are always blocked or may be presented for explicit approval.
 When set to `false`, destructive commands are blocked.
