@@ -1453,6 +1453,26 @@ async fn request_model_reply(
     }
 }
 
+fn normalize_assistant_response(response: &str) -> String {
+    let trimmed = response.trim();
+
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return response.to_string();
+    };
+
+    if parsed.get("type").and_then(|value| value.as_str()) == Some("tool_call") {
+        return response.to_string();
+    }
+
+    for key in ["response", "message", "content", "text", "answer"] {
+        if let Some(value) = parsed.get(key).and_then(|value| value.as_str()) {
+            return value.to_string();
+        }
+    }
+
+    response.to_string()
+}
+
 fn response_claims_destructive_action(response: &str) -> bool {
     let normalized = response.trim().to_lowercase();
 
@@ -1807,11 +1827,12 @@ async fn process_turn(
             break;
         }
 
-        let final_message = if response_claims_destructive_action(&full_message) {
+        let normalized_message = normalize_assistant_response(&full_message);
+        let final_message = if response_claims_destructive_action(&normalized_message) {
             "Blocked destructive command: assistant claimed execution without a runtime tool result"
                 .to_string()
         } else {
-            full_message
+            normalized_message
         };
 
         history.push(Message {
