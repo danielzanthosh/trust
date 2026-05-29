@@ -1,5 +1,7 @@
 # TRUST
 
+[![Hackatime](https://hackatime.hackclub.com/api/v1/badge/U0A4759P0Q0/danielzanthosh/trust)](https://hackatime.hackclub.com)
+
 A fast, lightweight AI assistant that runs directly inside the terminal.
 
 Built with Rust 🦀 for speed, safety, and performance.
