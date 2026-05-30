@@ -592,8 +592,7 @@ pub(crate) fn handle_local_command(
     if input == "/config" || input == "/config model" {
         app.add_info_message([
             "Config commands:",
-            "/config codex starts OAuth, copies the one-time code to clipboard, then imports available models",
-            "/config codex code shows the last one-time code if clipboard paste fails",
+            "/config codex starts OAuth if needed, shows the browser login link, then imports available models",
             "/config codex [name] [model=gpt-5] [base_url=https://api.openai.com/v1/responses] [priority=0] [active=true]",
             "/config model <name> base_url=<url> model=<model> [api_key=<key>|auth=codex] [priority=<n>] [active=true]",
             "/model lists configured models; /model <name> switches the active model.",
@@ -611,40 +610,48 @@ pub(crate) fn handle_local_command(
             .unwrap_or_default()
             .trim();
 
-        if args == "code" || args == "show-code" {
-            match read_last_codex_device_code() {
-                Ok(code) => app.add_info_message(format!("Codex one-time code:\n{}", code)),
-                Err(error) => app.add_info_message(error),
-            }
-
-            return true;
-        }
-
         if args.is_empty() {
-            match codex_login_status() {
-                Ok(status) if status.to_lowercase().contains("logged in") => {
-                    match import_codex_models() {
-                        Ok(summary) => {
-                            app.status = "Imported Codex models".to_string();
-                            app.add_info_message(format!(
-                                "{}\n\nConfigured models:\n{}",
-                                summary,
-                                describe_models()
-                            ));
-                        }
-                        Err(error) => {
-                            app.status = error.clone();
-                            app.add_info_message(error);
-                        }
+            if has_codex_oauth_token() {
+                match import_codex_models() {
+                    Ok(summary) => {
+                        app.status = "Imported Codex models".to_string();
+                        app.add_info_message(format!(
+                            "{}\n\nConfigured models:\n{}",
+                            summary,
+                            describe_models()
+                        ));
+                    }
+                    Err(error) => {
+                        app.status = error.clone();
+                        app.add_info_message(error);
                     }
                 }
-                _ => {
-                    app.status = "Starting Codex OAuth login...".to_string();
-                    app.add_info_message(
-                        "Starting Codex OAuth. TRUST will show the browser link and one-time code here, then import available Codex models after login completes."
-                            .to_string(),
-                    );
-                    start_codex_device_login(event_tx.clone());
+            } else {
+                match codex_login_status() {
+                    Ok(status) if status.to_lowercase().contains("logged in") => {
+                        match import_codex_models() {
+                            Ok(summary) => {
+                                app.status = "Imported Codex models".to_string();
+                                app.add_info_message(format!(
+                                    "{}\n\nConfigured models:\n{}",
+                                    summary,
+                                    describe_models()
+                                ));
+                            }
+                            Err(error) => {
+                                app.status = error.clone();
+                                app.add_info_message(error);
+                            }
+                        }
+                    }
+                    _ => {
+                        app.status = "Starting Codex OAuth login...".to_string();
+                        app.add_info_message(
+                            "Starting Codex OAuth. TRUST will show the browser login link here, then import available Codex models after login completes."
+                                .to_string(),
+                        );
+                        start_codex_oauth_login(event_tx.clone());
+                    }
                 }
             }
         } else {

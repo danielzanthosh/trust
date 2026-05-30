@@ -8,7 +8,7 @@ use serde_json::json;
 
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -106,101 +106,28 @@ fn strip_ansi_codes(input: &str) -> String {
     output
 }
 
-pub(crate) fn codex_device_code_path() -> PathBuf {
-    PathBuf::from("config").join("codex_device_code.txt")
-}
-
-pub(crate) fn read_last_codex_device_code() -> Result<String, String> {
-    fs::read_to_string(codex_device_code_path())
-        .map(|code| code.trim().to_string())
-        .map_err(|_| {
-            "No Codex device code is currently stored. Run /config codex first.".to_string()
-        })
-}
-
-fn save_last_codex_device_code(code: &str) {
-    let path = codex_device_code_path();
-
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    let _ = fs::write(path, code);
-}
-
 fn delete_last_codex_device_code() {
-    let _ = fs::remove_file(codex_device_code_path());
+    let _ = fs::remove_file(PathBuf::from("config").join("codex_device_code.txt"));
 }
 
-fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    if cfg!(windows) {
-        let mut child = Command::new("cmd")
-            .args(["/C", "clip"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| format!("Failed to start clipboard command: {}", error))?;
-
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(text.as_bytes())
-                .map_err(|error| format!("Failed to write to clipboard: {}", error))?;
-        }
-
-        let status = child
-            .wait()
-            .map_err(|error| format!("Failed waiting for clipboard command: {}", error))?;
-
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("Clipboard command exited with {}", status))
-        }
-    } else {
-        Err("Clipboard auto-copy is currently implemented for Windows only.".to_string())
-    }
-}
-
-fn codex_device_login_message(output: &[String]) -> String {
+fn codex_oauth_login_message(output: &[String]) -> String {
     let clean = strip_ansi_codes(&output.join("\n"));
     let url = clean
         .split_whitespace()
         .find(|part| part.starts_with("http://") || part.starts_with("https://"))
-        .unwrap_or("https://auth.openai.com/codex/device");
-
-    let code = clean
-        .lines()
-        .flat_map(|line| line.split_whitespace())
-        .find_map(|part| {
-            let normalized = part.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
-
-            (normalized.contains('-')
-                && normalized.len() >= 8
-                && normalized
-                    .chars()
-                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-'))
-            .then(|| normalized.to_string())
-        });
-
-    let code_status = if let Some(code) = code.as_deref() {
-        save_last_codex_device_code(code);
-
-        match copy_to_clipboard(code) {
-            Ok(()) => "Copied one-time code to clipboard.".to_string(),
-            Err(error) => format!(
-                "Could not copy one-time code automatically: {}\nType /config codex code to show it.",
-                error
-            ),
-        }
-    } else {
-        "Could not detect the one-time code. Type /config codex code to show the last stored code if available.".to_string()
-    };
+        .unwrap_or("<login URL not found>");
 
     format!(
-        "Codex OAuth login\n\nOpen this link:\n{}\n\n{}\nType /config codex code to show the code if clipboard paste fails.\n\nTRUST will import available Codex models after login completes.",
-        url, code_status
+        "Codex OAuth login\n\nOpen this link:\n{}\n\nTRUST will import available Codex models after login completes.",
+        url
     )
+}
+
+pub(crate) fn has_codex_oauth_token() -> bool {
+    codex_oauth_token()
+        .ok()
+        .flatten()
+        .is_some_and(|token| !token.trim().is_empty())
 }
 
 pub(crate) fn load_app_config() -> AppConfig {
@@ -560,7 +487,7 @@ pub(crate) fn codex_login_status() -> Result<String, String> {
     }
 }
 
-pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEvent>) {
+pub(crate) fn start_codex_oauth_login(event_tx: mpsc::UnboundedSender<RuntimeEvent>) {
     thread::spawn(move || {
         let mut command = match codex_command() {
             Ok(command) => command,
@@ -571,7 +498,7 @@ pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEv
         };
 
         let mut child = match command
-            .args(["login", "--device-auth"])
+            .arg("login")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -604,9 +531,8 @@ pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEv
                 let clean_line = strip_ansi_codes(&line);
                 initial_output.push(clean_line.clone());
 
-                if clean_line.contains("Never share this code") || clean_line.contains("Logged in")
-                {
-                    let _ = event_tx.send(RuntimeEvent::Info(codex_device_login_message(
+                if clean_line.contains("https://") || clean_line.contains("http://") {
+                    let _ = event_tx.send(RuntimeEvent::Info(codex_oauth_login_message(
                         &initial_output,
                     )));
                 }
@@ -623,7 +549,7 @@ pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEv
                     delete_last_codex_device_code();
 
                     let _ = event_tx.send(RuntimeEvent::Info(format!(
-                        "Codex OAuth login completed.\n{}\n\nOne-time code was removed from local storage.",
+                        "Codex OAuth login completed.\n{}",
                         summary
                     )));
                     let _ =
