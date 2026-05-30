@@ -60,7 +60,7 @@ struct ToolCall {
     args: ToolArgs,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct ToolArgs {
     path: Option<String>,
     content: Option<String>,
@@ -1457,6 +1457,97 @@ async fn request_model_reply(
     }
 }
 
+fn strip_json_code_fence(response: &str) -> &str {
+    let trimmed = response.trim();
+    let Some(after_opening) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+
+    let after_language = after_opening
+        .strip_prefix("json")
+        .or_else(|| after_opening.strip_prefix("JSON"))
+        .unwrap_or(after_opening)
+        .trim_start();
+
+    after_language
+        .strip_suffix("```")
+        .map(str::trim)
+        .unwrap_or(trimmed)
+}
+
+fn parse_tool_call_response(response: &str) -> Result<ToolCall, serde_json::Error> {
+    let candidate = strip_json_code_fence(response);
+
+    if let Ok(tool_call) = serde_json::from_str::<ToolCall>(candidate) {
+        return Ok(tool_call);
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(candidate)?;
+    let tool = value
+        .get("tool")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if tool.is_empty() {
+        return serde_json::from_str::<ToolCall>(candidate);
+    }
+
+    let args = if let Some(args) = value.get("args") {
+        serde_json::from_value::<ToolArgs>(args.clone()).unwrap_or_default()
+    } else {
+        ToolArgs {
+            path: value
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            content: value
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            url: value
+                .get("url")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            app: value
+                .get("app")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            command: value
+                .get("command")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            action: value
+                .get("action")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            selector: value
+                .get("selector")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            value: value
+                .get("value")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            session: value
+                .get("session")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            new_tab: value.get("new_tab").and_then(|value| value.as_bool()),
+        }
+    };
+
+    Ok(ToolCall {
+        r#type: value
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("tool_call")
+            .to_string(),
+        tool,
+        args,
+    })
+}
+
 fn latest_user_runtime_action_request(history: &[Message]) -> Option<&str> {
     history
         .iter()
@@ -1524,9 +1615,34 @@ fn response_looks_like_tool_avoidance(response: &str) -> bool {
     .any(|phrase| normalized.contains(phrase))
 }
 
+fn request_mentions_installed_app(user_request: &str) -> bool {
+    let normalized = user_request.to_lowercase();
+    [
+        "chrome",
+        "notepad",
+        "calculator",
+        "calc",
+        "edge",
+        "file explorer",
+        "explorer",
+        "terminal",
+        "powershell",
+    ]
+    .iter()
+    .any(|app| normalized.contains(app))
+}
+
+fn tool_call_matches_request(user_request: &str, tool_call: &ToolCall) -> bool {
+    if request_mentions_installed_app(user_request) {
+        return tool_call.tool == "run_command";
+    }
+
+    true
+}
+
 fn tool_reprompt_message(user_request: &str) -> String {
     format!(
-        "Runtime correction: The user requested a real computer/browser action, but your last response did not call a tool. Do not give a tutorial or say you cannot do it. Use the available runtime tools now. For opening apps use run_command. For navigating, reading, scrolling, clicking, or filling webpages use kimi_webbridge. If Kimi WebBridge is unavailable, call it anyway so the runtime can return the installation/setup message. User request: {}",
+        "Runtime correction: The user requested a real computer/browser action, but your last response did not correctly call the required tool. Do not give a tutorial or say you cannot do it. Use the available runtime tools now. For opening installed apps like Chrome or Notepad use run_command with PowerShell Start-Process. For navigating, reading, scrolling, clicking, or filling webpages use kimi_webbridge. If Kimi WebBridge is unavailable, call it anyway so the runtime can return the installation/setup message. User request: {}",
         user_request
     )
 }
@@ -1880,7 +1996,22 @@ async fn process_turn(
             }
         };
 
-        if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&full_message) {
+        if let Ok(tool_call) = parse_tool_call_response(&full_message) {
+            if let Some(user_request) = latest_user_runtime_action_request(&history)
+                && !tool_call_matches_request(user_request, &tool_call)
+                && step + 1 < MAX_AGENT_STEPS
+            {
+                let _ = event_tx.send(RuntimeEvent::DiscardAssistantDraft);
+                let _ = event_tx.send(RuntimeEvent::Status(
+                    "Correcting model: wrong tool selected...".to_string(),
+                ));
+                history.push(Message {
+                    role: "user".to_string(),
+                    content: tool_reprompt_message(user_request),
+                });
+                continue;
+            }
+
             history.push(Message {
                 role: "assistant".to_string(),
                 content: full_message,
@@ -2190,7 +2321,7 @@ fn delete_chat(chat_name: &str) -> Result<(), String> {
 }
 
 fn is_tool_call_json(content: &str) -> bool {
-    serde_json::from_str::<ToolCall>(content).is_ok()
+    parse_tool_call_response(content).is_ok()
 }
 
 fn ui_messages_from_history(history: &[Message]) -> Vec<UiMessage> {
