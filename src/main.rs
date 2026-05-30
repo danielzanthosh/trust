@@ -2613,6 +2613,114 @@ fn handle_local_command(app: &mut App, input: &str) -> bool {
     false
 }
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn extract_url_like(input: &str) -> Option<String> {
+    input
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | '.' | ';' | ':' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']'
+                )
+            })
+        })
+        .find_map(|word| {
+            let lower = word.to_lowercase();
+            if lower.starts_with("http://") || lower.starts_with("https://") {
+                Some(word.to_string())
+            } else if lower.contains('.') && !lower.contains('@') {
+                Some(format!("https://{}", word))
+            } else {
+                None
+            }
+        })
+}
+
+fn direct_runtime_command(input: &str) -> Option<String> {
+    let normalized = input.trim().to_lowercase();
+    let wants_launch = ["open", "launch", "start", "run"]
+        .iter()
+        .any(|word| normalized.contains(word));
+
+    if !wants_launch {
+        return None;
+    }
+
+    if normalized.contains("chrome") {
+        return Some(match extract_url_like(input) {
+            Some(url) => format!("Start-Process chrome {}", shell_single_quote(&url)),
+            None => "Start-Process chrome".to_string(),
+        });
+    }
+
+    if normalized.contains("edge") {
+        return Some(match extract_url_like(input) {
+            Some(url) => format!("Start-Process msedge {}", shell_single_quote(&url)),
+            None => "Start-Process msedge".to_string(),
+        });
+    }
+
+    if normalized.contains("notepad") {
+        return Some("Start-Process notepad".to_string());
+    }
+
+    if normalized.contains("calculator") || normalized.contains("calc") {
+        return Some("Start-Process calc".to_string());
+    }
+
+    if let Some(url) = extract_url_like(input) {
+        return Some(format!("Start-Process {}", shell_single_quote(&url)));
+    }
+
+    None
+}
+
+async fn process_direct_runtime_command(
+    current_chat: String,
+    mut history: Vec<Message>,
+    sandbox: SandboxConfig,
+    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    command: String,
+) {
+    let _ = event_tx.send(RuntimeEvent::Status(format!(
+        "Running PowerShell command: {}",
+        command
+    )));
+
+    let result = run_command(&sandbox, &command, &event_tx).await;
+    let _ = event_tx.send(RuntimeEvent::ToolResult(result.clone()));
+
+    history.push(Message {
+        role: "user".to_string(),
+        content: format!("{}{}", TOOL_RESULT_PREFIX, result.clone()),
+    });
+
+    let summary = if result.starts_with("Executed PowerShell command:") {
+        "Done.".to_string()
+    } else if result.starts_with("User declined") {
+        "Command declined.".to_string()
+    } else if result.starts_with("Blocked command:")
+        || result.starts_with("This command was blocked")
+    {
+        result
+    } else {
+        "I tried to run the command. Check the tool result above for details.".to_string()
+    };
+
+    history.push(Message {
+        role: "assistant".to_string(),
+        content: summary.clone(),
+    });
+    let _ = event_tx.send(RuntimeEvent::CommitAssistant(summary));
+
+    save_history(&current_chat, &history);
+    let _ = event_tx.send(RuntimeEvent::TurnFinished(history));
+}
+
 fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSender<RuntimeEvent>) {
     let input = app.input.trim().to_string();
     if input.is_empty() || app.busy {
@@ -2640,6 +2748,15 @@ fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSender<RuntimeE
     let history = app.model_history.clone();
     let runtime_tx = event_tx.clone();
     let sandbox = app.sandbox.clone();
+
+    if let Some(command) = direct_runtime_command(&input) {
+        app.status = "Running runtime action...".to_string();
+        tokio::spawn(async move {
+            process_direct_runtime_command(current_chat, history, sandbox, runtime_tx, command)
+                .await;
+        });
+        return;
+    }
 
     app.status = "Planning tool actions...".to_string();
 
