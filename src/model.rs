@@ -128,6 +128,10 @@ fn save_last_codex_device_code(code: &str) {
     let _ = fs::write(path, code);
 }
 
+fn delete_last_codex_device_code() {
+    let _ = fs::remove_file(codex_device_code_path());
+}
+
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
     if cfg!(windows) {
         let mut child = Command::new("cmd")
@@ -497,6 +501,8 @@ pub(crate) fn import_codex_models() -> Result<String, String> {
         ));
     }
 
+    delete_last_codex_device_code();
+
     let models = codex_models_from_json(&stdout)?;
 
     if models.is_empty() {
@@ -602,8 +608,10 @@ pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEv
         match child.wait() {
             Ok(status) if status.success() => match import_codex_models() {
                 Ok(summary) => {
+                    delete_last_codex_device_code();
+
                     let _ = event_tx.send(RuntimeEvent::Info(format!(
-                        "Codex OAuth login completed.\n{}",
+                        "Codex OAuth login completed.\n{}\n\nOne-time code was removed from local storage.",
                         summary
                     )));
                     let _ =
