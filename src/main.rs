@@ -44,8 +44,14 @@ const MAX_AGENT_STEPS: usize = 5;
 const DEFAULT_SANDBOX_DIR: &str = "sandbox/workspace";
 const DEFAULT_SANDBOX_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_TOKENS: u64 = 1024;
-const TOOL_RESULT_PREFIX: &str = "Tool result from TRUST runtime: ";
+const TOOL_RESULT_PREFIX: &str = "Tool result from TRUST runtime:";
 const WEBBRIDGE_COMMAND_URL: &str = "http://127.0.0.1:10086/command";
+const MODEL_STOP_SEQUENCES: [&str; 4] = [
+    "Tool result from TRUST runtime:",
+    "\nTool result from TRUST runtime:",
+    "Runtime output:",
+    "Tool Execution Success:",
+];
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Message {
@@ -1275,7 +1281,8 @@ fn build_request_body(model: &str, history: &[Message], provider: Provider) -> s
             "model": model,
             "messages": history,
             "stream": true,
-            "max_tokens": max_tokens
+            "max_tokens": max_tokens,
+            "stop": MODEL_STOP_SEQUENCES
         }),
         Provider::AnthropicCompatible => {
             let system = history
@@ -1306,7 +1313,8 @@ fn build_request_body(model: &str, history: &[Message], provider: Provider) -> s
                 "system": system,
                 "messages": messages,
                 "stream": true,
-                "max_tokens": max_tokens
+                "max_tokens": max_tokens,
+                "stop_sequences": MODEL_STOP_SEQUENCES
             })
         }
     }
@@ -1613,6 +1621,107 @@ fn response_looks_like_tool_avoidance(response: &str) -> bool {
     ]
     .iter()
     .any(|phrase| normalized.contains(phrase))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn extract_url_like(input: &str) -> Option<String> {
+    input
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | '.' | ';' | ':' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']'
+                )
+            })
+        })
+        .find_map(|word| {
+            let lower = word.to_lowercase();
+            if lower.starts_with("http://") || lower.starts_with("https://") {
+                Some(word.to_string())
+            } else if lower.contains('.') && !lower.contains('@') {
+                Some(format!("https://{}", word))
+            } else {
+                None
+            }
+        })
+}
+
+fn inferred_website_url(input: &str) -> Option<String> {
+    if let Some(url) = extract_url_like(input) {
+        return Some(url);
+    }
+
+    let normalized = input.to_lowercase();
+    if normalized.contains("apple")
+        && (normalized.contains("website") || normalized.contains("site"))
+    {
+        return Some("https://www.apple.com".to_string());
+    }
+    if normalized.contains("google")
+        && (normalized.contains("website") || normalized.contains("site"))
+    {
+        return Some("https://www.google.com".to_string());
+    }
+    if normalized.contains("youtube")
+        && (normalized.contains("website") || normalized.contains("site"))
+    {
+        return Some("https://www.youtube.com".to_string());
+    }
+
+    None
+}
+
+fn inferred_tool_call_for_request(user_request: &str) -> Option<ToolCall> {
+    let normalized = user_request.to_lowercase();
+
+    let command = if normalized.contains("chrome") {
+        Some(match extract_url_like(user_request) {
+            Some(url) => format!("Start-Process chrome {}", shell_single_quote(&url)),
+            None => "Start-Process chrome".to_string(),
+        })
+    } else if normalized.contains("notepad") {
+        Some("Start-Process notepad".to_string())
+    } else if normalized.contains("calculator") || normalized.contains("calc") {
+        Some("Start-Process calc".to_string())
+    } else if normalized.contains("edge") {
+        Some(match extract_url_like(user_request) {
+            Some(url) => format!("Start-Process msedge {}", shell_single_quote(&url)),
+            None => "Start-Process msedge".to_string(),
+        })
+    } else {
+        None
+    };
+
+    if let Some(command) = command {
+        return Some(ToolCall {
+            r#type: "tool_call".to_string(),
+            tool: "run_command".to_string(),
+            args: ToolArgs {
+                command: Some(command),
+                ..ToolArgs::default()
+            },
+        });
+    }
+
+    if let Some(url) = inferred_website_url(user_request) {
+        return Some(ToolCall {
+            r#type: "tool_call".to_string(),
+            tool: "kimi_webbridge".to_string(),
+            args: ToolArgs {
+                action: Some("navigate".to_string()),
+                url: Some(url),
+                new_tab: Some(true),
+                session: Some("trust".to_string()),
+                ..ToolArgs::default()
+            },
+        });
+    }
+
+    None
 }
 
 fn request_mentions_installed_app(user_request: &str) -> bool {
@@ -2050,6 +2159,29 @@ async fn process_turn(
             && step + 1 < MAX_AGENT_STEPS
         {
             let _ = event_tx.send(RuntimeEvent::DiscardAssistantDraft);
+
+            if let Some(tool_call) = inferred_tool_call_for_request(user_request) {
+                let tool_call_content = serde_json::to_string(&tool_call)
+                    .unwrap_or_else(|_| "<failed to serialize inferred tool call>".to_string());
+                history.push(Message {
+                    role: "assistant".to_string(),
+                    content: tool_call_content,
+                });
+
+                let _ = event_tx.send(RuntimeEvent::Status(format!(
+                    "Runtime enforcing tool: {}",
+                    tool_call.tool
+                )));
+                let tool_result = run_tool(tool_call, &sandbox, &event_tx).await;
+                let _ = event_tx.send(RuntimeEvent::ToolResult(tool_result.clone()));
+
+                history.push(Message {
+                    role: "user".to_string(),
+                    content: format!("{}{}", TOOL_RESULT_PREFIX, tool_result),
+                });
+                continue;
+            }
+
             let _ = event_tx.send(RuntimeEvent::Status(
                 "Correcting model: tool action required...".to_string(),
             ));
@@ -2091,11 +2223,11 @@ For normal conversation, answer normally in plain text and do not call tools. Do
 Do not use raw Markdown formatting for normal replies: avoid ### headings, **bold markers**, and long numbered instruction dumps. The TUI adds styling.
 If the user asks you to open, launch, navigate to, go to, search on, click, fill, or interact with an app/website/computer, that is not normal conversation: you MUST call an appropriate tool instead of giving instructions.
 You may use multiple tools across multiple steps in a single turn.
-When using a tool, reply ONLY with JSON and no extra text.
-After a tool runs, you will receive a follow-up message that starts with "Tool result from TRUST runtime:".
-Use that result to decide your next step or produce a final answer.
-When producing a final answer after a tool result, write normal human-readable text. Do not wrap the final answer in JSON.
-Never write fake tool results such as "Tool result from TRUST runtime" or "None required" yourself. Only the runtime provides tool results.
+When using a tool, reply ONLY with one JSON object and no prose, no markdown fences, no explanation, and no predicted result.
+After emitting a tool-call JSON object, STOP. The runtime will execute the tool and call you again with a message that starts with "Tool result from TRUST runtime:".
+Use that real runtime result to decide your next step or produce a final answer.
+When producing a final answer after a real tool result, write normal human-readable text. Do not wrap the final answer in JSON.
+Never write fake tool results such as "Tool result from TRUST runtime", "Runtime output", "Tool Execution Success", or "None required" yourself. Only the runtime provides tool results.
 
 You operate with controlled autonomy inside a sandbox.
 File tools resolve only inside the sandbox directories: workspace/, outputs/, and temp/.
@@ -2231,7 +2363,7 @@ Safety rules:
 - You may request run_command when needed, but the runtime decides whether it executes.
 - Destructive commands targeting system folders, Windows/System32, boot files, registry hives, entire drives, security tools, or user profiles may be blocked unless ALLOW_DESTRUCTIVE_ACTIONS=true and the user explicitly approves them.
 - If the runtime blocks a command, briefly explain that the runtime blocked it and suggest a safer alternative.
-- Never claim a command ran unless the runtime returns a tool result confirming it ran.
+- Never claim a command ran unless the runtime returns a real tool result confirming it ran.
 - Never pretend to save files, read files, list directories, open apps, browse websites, click elements, fill fields, or run commands. Use a tool when available.
 - If a tool is useful, prefer actually using it over just describing what would happen.
 - If a requested action needs a tool but the tool is unavailable or fails, say that clearly and stop; do not replace the action with a tutorial.
