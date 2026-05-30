@@ -41,6 +41,24 @@ pub(crate) fn parse_tool_call_response(response: &str) -> Result<ToolCall, serde
         return Ok(tool_call);
     }
 
+    if let Ok(tool_call) = parse_tool_call_value(candidate) {
+        return Ok(tool_call);
+    }
+
+    for json_candidate in embedded_json_objects(candidate) {
+        if let Ok(tool_call) = serde_json::from_str::<ToolCall>(&json_candidate) {
+            return Ok(tool_call);
+        }
+
+        if let Ok(tool_call) = parse_tool_call_value(&json_candidate) {
+            return Ok(tool_call);
+        }
+    }
+
+    serde_json::from_str::<ToolCall>(candidate)
+}
+
+fn parse_tool_call_value(candidate: &str) -> Result<ToolCall, serde_json::Error> {
     let value = serde_json::from_str::<serde_json::Value>(candidate)?;
 
     let tool = value
@@ -117,6 +135,52 @@ pub(crate) fn parse_tool_call_response(response: &str) -> Result<ToolCall, serde
 
         args,
     })
+}
+
+fn embedded_json_objects(input: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(start_index) = start.take()
+                {
+                    let end = index + ch.len_utf8();
+                    let candidate = input[start_index..end].to_string();
+                    if candidate.contains("\"tool\"") {
+                        objects.push(candidate);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    objects
 }
 
 pub(crate) fn latest_user_runtime_action_request(history: &[Message]) -> Option<&str> {
@@ -401,30 +465,63 @@ pub(crate) fn tool_reprompt_message(user_request: &str) -> String {
 pub(crate) fn normalize_assistant_response(response: &str) -> String {
     let trimmed = response.trim();
 
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return response.to_string();
-    };
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if parsed.get("type").and_then(|value| value.as_str()) == Some("tool_call") {
+            return response.to_string();
+        }
 
-    if parsed.get("type").and_then(|value| value.as_str()) == Some("tool_call") {
-        return response.to_string();
-    }
-
-    for key in [
-        "response",
-        "message",
-        "content",
-        "text",
-        "answer",
-        "tool_result_from_TRUST_runtime",
-        "tool_result",
-        "result",
-    ] {
-        if let Some(value) = parsed.get(key).and_then(|value| value.as_str()) {
-            return value.to_string();
+        for key in [
+            "response",
+            "message",
+            "content",
+            "text",
+            "answer",
+            "tool_result_from_TRUST_runtime",
+            "tool_result",
+            "result",
+        ] {
+            if let Some(value) = parsed.get(key).and_then(|value| value.as_str()) {
+                return strip_visible_reasoning(value);
+            }
         }
     }
 
-    response.to_string()
+    strip_visible_reasoning(trimmed)
+}
+
+fn strip_visible_reasoning(response: &str) -> String {
+    let mut cleaned = response.trim().to_string();
+
+    for marker in [
+        "The user ",
+        "The user says",
+        "User says",
+        "We just respond",
+        "We need to ",
+        "Need to ",
+        "According to ",
+        "So we need ",
+        "Let's ",
+        "Maybe ",
+        "Could ",
+        "Perhaps ",
+        "No need to ",
+        "No need ",
+    ] {
+        if let Some(index) = cleaned.find(marker)
+            && index > 0
+        {
+            cleaned.truncate(index);
+        }
+    }
+
+    if let Some(index) = cleaned.find('{')
+        && cleaned[index..].contains("\"tool\"")
+    {
+        cleaned.truncate(index);
+    }
+
+    cleaned.trim().to_string()
 }
 
 pub(crate) fn response_claims_destructive_action(response: &str) -> bool {
@@ -837,10 +934,13 @@ pub(crate) async fn process_turn(
                 continue;
             }
 
+            let tool_call_content =
+                serde_json::to_string(&tool_call).unwrap_or_else(|_| full_message.clone());
+
             history.push(Message {
                 role: "assistant".to_string(),
 
-                content: full_message,
+                content: tool_call_content,
             });
 
             let _ = event_tx.send(RuntimeEvent::DiscardAssistantDraft);
@@ -940,6 +1040,8 @@ pub(crate) async fn process_turn(
         let final_message = if response_claims_destructive_action(&normalized_message) {
             "Blocked destructive command: assistant claimed execution without a runtime tool result"
                 .to_string()
+        } else if normalized_message.trim().is_empty() {
+            "Done.".to_string()
         } else {
             normalized_message
         };

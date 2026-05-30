@@ -204,21 +204,21 @@ pub(crate) fn build_transcript(app: &App) -> Text<'static> {
 
     if !app.draft_assistant.is_empty() {
         lines.extend(styled_message_lines(
-            "TRUST",
-            Color::Green,
+            "Thinking",
+            Color::DarkGray,
             &app.draft_assistant,
         ));
     } else if app.busy {
         lines.push(Line::from(vec![
             Span::styled(
-                "TRUST: ",
+                "Thinking: ",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("{} thinking…", spinner()),
-                Style::default().fg(Color::LightGreen),
+                Style::default().fg(Color::DarkGray),
             ),
         ]));
     }
