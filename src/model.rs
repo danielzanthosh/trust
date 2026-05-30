@@ -973,8 +973,6 @@ fn request_codex_cli_reply(
             "--ephemeral",
             "--sandbox",
             "read-only",
-            "--ask-for-approval",
-            "never",
             "--output-last-message",
         ])
         .arg(&output_path)
