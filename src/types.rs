@@ -74,6 +74,8 @@ pub(crate) struct ToolArgs {
 pub(crate) enum Provider {
     OpenAiCompatible,
 
+    OpenAiResponsesCompatible,
+
     AnthropicCompatible,
 }
 

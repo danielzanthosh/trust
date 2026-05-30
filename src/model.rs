@@ -17,6 +17,8 @@ pub(crate) fn detect_provider(base_url: &str) -> Provider {
 
     if normalized.contains("anthropic") || normalized.ends_with("/v1/messages") {
         Provider::AnthropicCompatible
+    } else if normalized.ends_with("/v1/responses") || normalized.ends_with("/responses") {
+        Provider::OpenAiResponsesCompatible
     } else {
         Provider::OpenAiCompatible
     }
@@ -27,12 +29,16 @@ pub(crate) fn build_request_url(base_url: &str, provider: Provider) -> String {
 
     if normalized.ends_with("/v1/chat/completions")
         || normalized.ends_with("/chat/completions")
+        || normalized.ends_with("/v1/responses")
+        || normalized.ends_with("/responses")
         || normalized.ends_with("/v1/messages")
     {
         normalized.to_string()
     } else {
         match provider {
             Provider::OpenAiCompatible => format!("{}/v1/chat/completions", normalized),
+
+            Provider::OpenAiResponsesCompatible => format!("{}/v1/responses", normalized),
 
             Provider::AnthropicCompatible => format!("{}/v1/messages", normalized),
         }
@@ -45,7 +51,7 @@ pub(crate) fn build_headers(api_key: &str, provider: Provider) -> Result<HeaderM
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
     match provider {
-        Provider::OpenAiCompatible => {
+        Provider::OpenAiCompatible | Provider::OpenAiResponsesCompatible => {
             let value = format!("Bearer {}", api_key);
 
             let header = HeaderValue::from_str(&value)
@@ -96,6 +102,42 @@ pub(crate) fn build_request_body(
             "stop": MODEL_STOP_SEQUENCES
 
         }),
+
+        Provider::OpenAiResponsesCompatible => {
+            let instructions = history
+                .iter()
+                .filter(|message| message.role == "system")
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            let input = history
+                .iter()
+                .filter(|message| message.role != "system")
+                .map(|message| {
+                    json!({
+                        "role": message.role,
+                        "content": message.content,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            json!({
+
+                "model": model,
+
+                "instructions": instructions,
+
+                "input": input,
+
+                "stream": true,
+
+                "max_output_tokens": max_tokens,
+
+                "truncation": "auto"
+
+            })
+        }
 
         Provider::AnthropicCompatible => {
             let system = history
@@ -160,6 +202,22 @@ pub(crate) fn extract_stream_text(data: &str) -> String {
     // Some OpenAI-compatible providers stream plain text here.
 
     if let Some(content) = parsed["choices"][0]["text"].as_str() {
+        return content.to_string();
+    }
+
+    // OpenAI Responses API streaming: response.output_text.delta -> delta
+
+    if parsed["type"].as_str() == Some("response.output_text.delta") {
+        if let Some(content) = parsed["delta"].as_str() {
+            return content.to_string();
+        }
+    }
+
+    if let Some(content) = parsed["output_text"].as_str() {
+        return content.to_string();
+    }
+
+    if let Some(content) = parsed["response"]["output"][0]["content"][0]["text"].as_str() {
         return content.to_string();
     }
 
