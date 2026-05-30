@@ -366,6 +366,8 @@ pub(crate) fn friendly_tool_summary(tool_call: &ToolCall, tool_result: &str) -> 
 
             "snapshot" | "read" => "I've read the page for you.".to_string(),
 
+            "scroll" => "I've scrolled the page for you.".to_string(),
+
             _ => "Done.".to_string(),
         },
 
@@ -405,6 +407,49 @@ pub(crate) fn inferred_tool_call_for_request(user_request: &str) -> Option<ToolC
             args: ToolArgs {
                 command: Some(command),
 
+                ..ToolArgs::default()
+            },
+        });
+    }
+
+    if normalized.contains("scroll") {
+        let direction = if normalized.contains("up") {
+            "up"
+        } else {
+            "down"
+        };
+        let target = user_request
+            .split_once("until")
+            .map(|(_, target)| target.trim())
+            .filter(|target| !target.is_empty())
+            .or_else(|| {
+                user_request
+                    .split_once("see")
+                    .map(|(_, target)| target.trim())
+                    .filter(|target| !target.is_empty())
+            });
+
+        let content = if let Some(target) = target {
+            format!(
+                "async () => {{ const target = {}; const direction = {}; for (let i = 0; i < 20; i++) {{ if (document.body && document.body.innerText.toLowerCase().includes(target.toLowerCase())) return 'Found: ' + target; window.scrollBy(0, direction === 'up' ? -Math.floor(window.innerHeight * 0.8) : Math.floor(window.innerHeight * 0.8)); await new Promise(r => setTimeout(r, 250)); }} return document.body && document.body.innerText.toLowerCase().includes(target.toLowerCase()) ? 'Found: ' + target : 'Scrolled but did not find: ' + target; }}",
+                serde_json::to_string(target).unwrap_or_else(|_| "\"\"".to_string()),
+                serde_json::to_string(direction).unwrap_or_else(|_| "\"down\"".to_string())
+            )
+        } else {
+            format!(
+                "() => {{ window.scrollBy(0, {}Math.floor(window.innerHeight * 0.8)); return 'Scrolled {}'; }}",
+                if direction == "up" { "-" } else { "" },
+                direction
+            )
+        };
+
+        return Some(ToolCall {
+            r#type: "tool_call".to_string(),
+            tool: "kimi_webbridge".to_string(),
+            args: ToolArgs {
+                action: Some("scroll".to_string()),
+                content: Some(content),
+                session: Some("trust".to_string()),
                 ..ToolArgs::default()
             },
         });
@@ -794,12 +839,20 @@ pub(crate) async fn run_webbridge_tool(tool_call: ToolCall) -> String {
             send_webbridge_command("evaluate", json!({ "code": code }), session).await
         }
 
+        "scroll" => {
+            let code = tool_call.args.content.unwrap_or_else(|| {
+                "() => { window.scrollBy(0, Math.floor(window.innerHeight * 0.8)); return 'Scrolled down'; }".to_string()
+            });
+
+            send_webbridge_command("evaluate", json!({ "code": code }), session).await
+        }
+
         "tabs" | "list_tabs" => send_webbridge_command("list_tabs", json!({}), session).await,
 
         "close_tab" => send_webbridge_command("close_tab", json!({}), session).await,
 
         other => format!(
-            "Unknown Kimi WebBridge action: {}. Supported actions: navigate, snapshot, click, fill, evaluate, list_tabs, close_tab",
+            "Unknown Kimi WebBridge action: {}. Supported actions: navigate, snapshot, click, fill, scroll, evaluate, list_tabs, close_tab",
             other
         ),
     }
