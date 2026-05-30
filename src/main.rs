@@ -1457,6 +1457,80 @@ async fn request_model_reply(
     }
 }
 
+fn latest_user_runtime_action_request(history: &[Message]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .filter(|message| {
+            message.role == "user" && !message.content.starts_with(TOOL_RESULT_PREFIX)
+        })
+        .map(|message| message.content.as_str())
+        .find(|content| user_requested_runtime_action(content))
+}
+
+fn user_requested_runtime_action(input: &str) -> bool {
+    let normalized = input.to_lowercase();
+    [
+        "open ",
+        "launch ",
+        "start ",
+        "go to",
+        "navigate",
+        "visit",
+        "website",
+        "browser",
+        "chrome",
+        "click",
+        "fill",
+        "type ",
+        "scroll",
+        "find ",
+        "search",
+        "look for",
+        "you have to do it",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn response_looks_like_tool_avoidance(response: &str) -> bool {
+    let normalized = response.to_lowercase();
+    [
+        "i can't directly",
+        "i cannot directly",
+        "i don't have access",
+        "i can guide",
+        "i'll help you",
+        "i will help you",
+        "i'll open",
+        "i will open",
+        "should i",
+        "would you like me",
+        "let me initiate",
+        "let me start",
+        "here's how",
+        "here is how",
+        "follow these steps",
+        "manually",
+        "you can open",
+        "you can click",
+        "please click",
+        "tool result from trust runtime",
+        "the command executed successfully",
+        "initiated chrome",
+        "none required for this interaction",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn tool_reprompt_message(user_request: &str) -> String {
+    format!(
+        "Runtime correction: The user requested a real computer/browser action, but your last response did not call a tool. Do not give a tutorial or say you cannot do it. Use the available runtime tools now. For opening apps use run_command. For navigating, reading, scrolling, clicking, or filling webpages use kimi_webbridge. If Kimi WebBridge is unavailable, call it anyway so the runtime can return the installation/setup message. User request: {}",
+        user_request
+    )
+}
+
 fn normalize_assistant_response(response: &str) -> String {
     let trimmed = response.trim();
 
@@ -1840,6 +1914,21 @@ async fn process_turn(
             break;
         }
 
+        if let Some(user_request) = latest_user_runtime_action_request(&history)
+            && response_looks_like_tool_avoidance(&full_message)
+            && step + 1 < MAX_AGENT_STEPS
+        {
+            let _ = event_tx.send(RuntimeEvent::DiscardAssistantDraft);
+            let _ = event_tx.send(RuntimeEvent::Status(
+                "Correcting model: tool action required...".to_string(),
+            ));
+            history.push(Message {
+                role: "user".to_string(),
+                content: tool_reprompt_message(user_request),
+            });
+            continue;
+        }
+
         let normalized_message = normalize_assistant_response(&full_message);
         let final_message = if response_claims_destructive_action(&normalized_message) {
             "Blocked destructive command: assistant claimed execution without a runtime tool result"
@@ -1927,7 +2016,19 @@ Example delayed PowerShell action:
   }
 }
 
-Example Kimi WebBridge navigate tool call:
+Example Kimi WebBridge navigate tool call for "go to the Apple website":
+{
+  "type": "tool_call",
+  "tool": "kimi_webbridge",
+  "args": {
+    "action": "navigate",
+    "url": "https://www.apple.com",
+    "new_tab": true,
+    "session": "trust"
+  }
+}
+
+Example Kimi WebBridge navigate tool call for "go to https://www.youtube.com":
 {
   "type": "tool_call",
   "tool": "kimi_webbridge",
@@ -1980,9 +2081,9 @@ Allowed tools:
 
 Command planning rules:
 - Understand the user's intent, generate PowerShell, rely on the runtime's destructive-command detector, request execution through run_command, then explain the result.
-- If the user asks to open, launch, or start an installed app, browser, Chrome, Edge, terminal, file explorer, or desktop program, immediately call run_command with PowerShell Start-Process. Do not answer with instructions. Do not use Kimi WebBridge for launching apps.
-- If the user asks to open, go to, or navigate to a website/URL in the normal browser, immediately call run_command with Start-Process chrome '<url>' or Start-Process '<url>'. Preserve the exact requested URL and do not invent a different URL.
-- If the user gives a multi-step browser task like "open Chrome, go to a site, click something, fill a form", do it as tool steps: first run_command to open Chrome/site, then use Kimi WebBridge snapshot/click/fill for page interaction. Do not respond with a written tutorial.
+- If the user asks to open, launch, or start an installed app, browser, Chrome, Edge, terminal, file explorer, or desktop program, immediately call run_command with PowerShell Start-Process. Do not ask for confirmation for non-destructive app launches. Do not answer with instructions. Do not use Kimi WebBridge for launching apps.
+- If the user asks to open, go to, visit, or navigate to a website/URL/page, immediately call Kimi WebBridge navigate. Preserve the exact requested URL when present. For named common sites, use the canonical URL, e.g. Apple website -> https://www.apple.com. Do not assume WebBridge is unavailable; call the tool first. If WebBridge is unavailable, report the setup message returned by the runtime.
+- If the user gives a multi-step browser task like "open Chrome, go to a site, click something, fill a form", do it as tool steps: use run_command only to launch Chrome if explicitly requested, then use Kimi WebBridge navigate/snapshot/click/fill for page interaction. Do not respond with a written tutorial.
 - If the user asks to search the web from the browser, call run_command with a browser URL for the search query.
 - Use Kimi WebBridge only when the user asks to inspect, read, click, type, fill, search inside, configure, buy, check out, or otherwise interact with webpage contents after a page is open.
 - You may fill harmless sample data when explicitly asked, but do not enter real personal/payment credentials. Do not complete purchases, submit payment, or place orders.
@@ -1993,7 +2094,7 @@ Command planning rules:
 Safety rules:
 - Do not claim you cannot interact with the computer or browser when an allowed tool can do the task.
 - If the user asks to open or launch Chrome, a browser, or any installed app, use run_command with Start-Process.
-- If the user asks to open a specific website or URL in the normal browser, use run_command and preserve the exact requested URL.
+- If the user asks to open, go to, visit, or navigate to a specific website or URL, use Kimi WebBridge navigate and preserve the exact requested URL.
 - If the user asks to read, click, type, search inside, inspect, configure, buy, check out, or interact with a webpage, use kimi_webbridge. If the tool result says Kimi WebBridge is not available, tell the user to install the browser extension and start the device daemon first.
 - Do not access private data such as .env files unless the user explicitly asks and the runtime allows it.
 - You may request run_command when needed, but the runtime decides whether it executes.
@@ -2613,114 +2714,6 @@ fn handle_local_command(app: &mut App, input: &str) -> bool {
     false
 }
 
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn extract_url_like(input: &str) -> Option<String> {
-    input
-        .split_whitespace()
-        .map(|word| {
-            word.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    ',' | '.' | ';' | ':' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']'
-                )
-            })
-        })
-        .find_map(|word| {
-            let lower = word.to_lowercase();
-            if lower.starts_with("http://") || lower.starts_with("https://") {
-                Some(word.to_string())
-            } else if lower.contains('.') && !lower.contains('@') {
-                Some(format!("https://{}", word))
-            } else {
-                None
-            }
-        })
-}
-
-fn direct_runtime_command(input: &str) -> Option<String> {
-    let normalized = input.trim().to_lowercase();
-    let wants_launch = ["open", "launch", "start", "run"]
-        .iter()
-        .any(|word| normalized.contains(word));
-
-    if !wants_launch {
-        return None;
-    }
-
-    if normalized.contains("chrome") {
-        return Some(match extract_url_like(input) {
-            Some(url) => format!("Start-Process chrome {}", shell_single_quote(&url)),
-            None => "Start-Process chrome".to_string(),
-        });
-    }
-
-    if normalized.contains("edge") {
-        return Some(match extract_url_like(input) {
-            Some(url) => format!("Start-Process msedge {}", shell_single_quote(&url)),
-            None => "Start-Process msedge".to_string(),
-        });
-    }
-
-    if normalized.contains("notepad") {
-        return Some("Start-Process notepad".to_string());
-    }
-
-    if normalized.contains("calculator") || normalized.contains("calc") {
-        return Some("Start-Process calc".to_string());
-    }
-
-    if let Some(url) = extract_url_like(input) {
-        return Some(format!("Start-Process {}", shell_single_quote(&url)));
-    }
-
-    None
-}
-
-async fn process_direct_runtime_command(
-    current_chat: String,
-    mut history: Vec<Message>,
-    sandbox: SandboxConfig,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    command: String,
-) {
-    let _ = event_tx.send(RuntimeEvent::Status(format!(
-        "Running PowerShell command: {}",
-        command
-    )));
-
-    let result = run_command(&sandbox, &command, &event_tx).await;
-    let _ = event_tx.send(RuntimeEvent::ToolResult(result.clone()));
-
-    history.push(Message {
-        role: "user".to_string(),
-        content: format!("{}{}", TOOL_RESULT_PREFIX, result.clone()),
-    });
-
-    let summary = if result.starts_with("Executed PowerShell command:") {
-        "Done.".to_string()
-    } else if result.starts_with("User declined") {
-        "Command declined.".to_string()
-    } else if result.starts_with("Blocked command:")
-        || result.starts_with("This command was blocked")
-    {
-        result
-    } else {
-        "I tried to run the command. Check the tool result above for details.".to_string()
-    };
-
-    history.push(Message {
-        role: "assistant".to_string(),
-        content: summary.clone(),
-    });
-    let _ = event_tx.send(RuntimeEvent::CommitAssistant(summary));
-
-    save_history(&current_chat, &history);
-    let _ = event_tx.send(RuntimeEvent::TurnFinished(history));
-}
-
 fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSender<RuntimeEvent>) {
     let input = app.input.trim().to_string();
     if input.is_empty() || app.busy {
@@ -2748,15 +2741,6 @@ fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSender<RuntimeE
     let history = app.model_history.clone();
     let runtime_tx = event_tx.clone();
     let sandbox = app.sandbox.clone();
-
-    if let Some(command) = direct_runtime_command(&input) {
-        app.status = "Running runtime action...".to_string();
-        tokio::spawn(async move {
-            process_direct_runtime_command(current_chat, history, sandbox, runtime_tx, command)
-                .await;
-        });
-        return;
-    }
 
     app.status = "Planning tool actions...".to_string();
 
