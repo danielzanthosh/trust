@@ -273,18 +273,6 @@ impl App {
         self.auto_scroll = true;
     }
 
-    fn scroll_up(&mut self, amount: u16) {
-        self.transcript_scroll = self.transcript_scroll.saturating_sub(amount);
-        self.auto_scroll = false;
-    }
-
-    fn scroll_down(&mut self, amount: u16) {
-        self.transcript_scroll = self.transcript_scroll.saturating_add(amount);
-        if self.transcript_scroll == u16::MAX {
-            self.auto_scroll = true;
-        }
-    }
-
     fn push_visible_message(&mut self, role: UiMessageRole, content: String) {
         if content.trim().is_empty() {
             return;
@@ -2676,18 +2664,38 @@ fn transcript_viewport_size() -> Option<(u16, u16)> {
     ))
 }
 
-fn scroll_down_visible(app: &mut App, amount: u16) {
-    app.scroll_down(amount);
+fn transcript_max_scroll(app: &App) -> Option<u16> {
+    let (width, height) = transcript_viewport_size()?;
+    let content_lines = transcript_line_count(app, width).min(usize::from(u16::MAX)) as u16;
 
-    let Some((width, height)) = transcript_viewport_size() else {
-        return;
+    Some(content_lines.saturating_sub(height))
+}
+
+fn scroll_up_visible(app: &mut App, amount: u16) {
+    let current_scroll = if app.auto_scroll || app.transcript_scroll == u16::MAX {
+        transcript_max_scroll(app).unwrap_or(0)
+    } else {
+        app.transcript_scroll
     };
 
-    let content_lines = transcript_line_count(app, width).min(usize::from(u16::MAX)) as u16;
-    let max_scroll = content_lines.saturating_sub(height);
+    app.transcript_scroll = current_scroll.saturating_sub(amount);
+    app.auto_scroll = false;
+}
 
-    if app.transcript_scroll >= max_scroll {
+fn scroll_down_visible(app: &mut App, amount: u16) {
+    let max_scroll = transcript_max_scroll(app).unwrap_or(0);
+    let current_scroll = if app.auto_scroll || app.transcript_scroll == u16::MAX {
+        max_scroll
+    } else {
+        app.transcript_scroll.min(max_scroll)
+    };
+    let next_scroll = current_scroll.saturating_add(amount).min(max_scroll);
+
+    if next_scroll >= max_scroll {
         app.scroll_to_bottom();
+    } else {
+        app.transcript_scroll = next_scroll;
+        app.auto_scroll = false;
     }
 }
 
@@ -2707,8 +2715,8 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
     }
 
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_up(1),
-        MouseEventKind::ScrollDown => scroll_down_visible(app, 1),
+        MouseEventKind::ScrollUp => scroll_up_visible(app, 2),
+        MouseEventKind::ScrollDown => scroll_down_visible(app, 2),
         _ => {}
     }
 }
@@ -2745,9 +2753,9 @@ fn handle_key_event(app: &mut App, key: KeyEvent, event_tx: &mpsc::UnboundedSend
             app.should_quit = true;
         }
         KeyCode::Enter => submit_current_input(app, event_tx),
-        KeyCode::Up => app.scroll_up(1),
+        KeyCode::Up => scroll_up_visible(app, 1),
         KeyCode::Down => scroll_down_visible(app, 1),
-        KeyCode::PageUp => app.scroll_up(8),
+        KeyCode::PageUp => scroll_up_visible(app, 8),
         KeyCode::PageDown => scroll_down_visible(app, 8),
         KeyCode::Home => {
             app.transcript_scroll = 0;
