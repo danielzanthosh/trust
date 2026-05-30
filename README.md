@@ -52,7 +52,8 @@ TRUST also supports a persistent multi-model registry in `config/models.json` (i
 | `/model` | List configured models and fallback priority |
 | `/model <name>` | Switch the active model |
 | `/config` | Show model configuration help |
-| `/config codex` | Start Codex OAuth if needed, show the browser login link, then import available Codex models |
+| `/config codex` | Start Codex OAuth browser login, show the login link, then import available Codex models |
+| `/config codex import` | Import available models from the existing Codex login without opening OAuth |
 | `/config codex [name] [model=gpt-5] [priority=0]` | Manually add/update one Codex OAuth model |
 | `/config model <name> base_url=<url> model=<model> [api_key=<key>|auth=codex] [priority=<n>] [active=true]` | Add/update a model config |
 | `/exit`, `/quit` | Exit the app |

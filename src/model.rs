@@ -123,13 +123,6 @@ fn codex_oauth_login_message(output: &[String]) -> String {
     )
 }
 
-pub(crate) fn has_codex_oauth_token() -> bool {
-    codex_oauth_token()
-        .ok()
-        .flatten()
-        .is_some_and(|token| !token.trim().is_empty())
-}
-
 pub(crate) fn load_app_config() -> AppConfig {
     let path = model_config_path();
 
@@ -468,23 +461,6 @@ pub(crate) fn import_codex_models() -> Result<String, String> {
             .collect::<Vec<_>>()
             .join("\n")
     ))
-}
-
-pub(crate) fn codex_login_status() -> Result<String, String> {
-    let output = codex_command()?
-        .args(["login", "status"])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("Failed to run `codex login status`: {}", error))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        Err(format!("{}{}", stdout, stderr))
-    }
 }
 
 pub(crate) fn start_codex_oauth_login(event_tx: mpsc::UnboundedSender<RuntimeEvent>) {
@@ -944,7 +920,7 @@ fn resolve_api_key(config: &ModelConfig) -> Result<String, String> {
 
     if auth_mode == "codex" || openai_base {
         Err(format!(
-            "Model '{}' needs Codex OAuth, but no token was found at ~/.codex/auth.json. Run Codex login first or set api_key=... .",
+            "Model '{}' needs Codex OAuth, but TRUST could not find a usable token at ~/.codex/auth.json. Run /config codex to open the OAuth login flow, then retry. If you still see missing scope errors, that Codex token cannot be used directly with the OpenAI Responses API for your account/project.",
             config.name
         ))
     } else {
