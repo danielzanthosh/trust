@@ -21,6 +21,66 @@ pub(crate) fn model_config_path() -> PathBuf {
     PathBuf::from("config").join("models.json")
 }
 
+fn command_exists(path: &PathBuf) -> bool {
+    path.exists() && path.is_file()
+}
+
+fn codex_cli_path() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("CODEX_BIN").map(PathBuf::from)
+        && command_exists(&path)
+    {
+        return Some(path);
+    }
+
+    let executable_names: &[&str] = if cfg!(windows) {
+        &["codex.cmd", "codex.exe", "codex.bat", "codex"]
+    } else {
+        &["codex"]
+    };
+
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            for name in executable_names {
+                let candidate = dir.join(name);
+                if command_exists(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+
+    if cfg!(windows) {
+        if let Some(appdata) = env::var_os("APPDATA").map(PathBuf::from) {
+            for name in executable_names {
+                candidates.push(appdata.join("npm").join(name));
+            }
+        }
+    }
+
+    if let Some(home) = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    {
+        for name in executable_names {
+            candidates.push(home.join("AppData").join("Roaming").join("npm").join(name));
+            candidates.push(home.join(".local").join("bin").join(name));
+            candidates.push(home.join(".npm-global").join("bin").join(name));
+        }
+    }
+
+    candidates.into_iter().find(command_exists)
+}
+
+fn codex_command() -> Result<Command, String> {
+    let path = codex_cli_path().ok_or_else(|| {
+        "Codex CLI was not found. Install Codex or set CODEX_BIN to the full path, e.g. C:\\Users\\<you>\\AppData\\Roaming\\npm\\codex.cmd".to_string()
+    })?;
+
+    Ok(Command::new(path))
+}
+
 pub(crate) fn load_app_config() -> AppConfig {
     let path = model_config_path();
 
@@ -301,7 +361,7 @@ fn codex_models_from_json(content: &str) -> Result<Vec<ModelConfig>, String> {
 }
 
 pub(crate) fn import_codex_models() -> Result<String, String> {
-    let output = Command::new("codex")
+    let output = codex_command()?
         .args(["debug", "models"])
         .stdin(Stdio::null())
         .output()
@@ -360,7 +420,7 @@ pub(crate) fn import_codex_models() -> Result<String, String> {
 }
 
 pub(crate) fn codex_login_status() -> Result<String, String> {
-    let output = Command::new("codex")
+    let output = codex_command()?
         .args(["login", "status"])
         .stdin(Stdio::null())
         .output()
@@ -378,7 +438,15 @@ pub(crate) fn codex_login_status() -> Result<String, String> {
 
 pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEvent>) {
     thread::spawn(move || {
-        let mut child = match Command::new("codex")
+        let mut command = match codex_command() {
+            Ok(command) => command,
+            Err(error) => {
+                let _ = event_tx.send(RuntimeEvent::Info(error));
+                return;
+            }
+        };
+
+        let mut child = match command
             .args(["login", "--device-auth"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
