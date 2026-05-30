@@ -597,6 +597,14 @@ pub(crate) fn start_codex_oauth_login(event_tx: mpsc::UnboundedSender<RuntimeEve
 pub(crate) fn parse_codex_config_command(args: &str) -> Result<(ModelConfig, bool), String> {
     let mut parts = args.split_whitespace();
     let first = parts.next().unwrap_or("codex");
+
+    if matches!(first, "code" | "show-code" | "import" | "login" | "oauth") {
+        return Err(format!(
+            "'{}' is reserved for /config codex. Use a different model config name.",
+            first
+        ));
+    }
+
     let (name, rest) = if first.contains('=') {
         ("codex".to_string(), args.to_string())
     } else {
