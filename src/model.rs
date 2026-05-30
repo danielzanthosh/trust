@@ -521,8 +521,6 @@ pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEv
             let reader = BufReader::new(stdout);
 
             for line in reader.lines().map_while(Result::ok) {
-                initial_output.push(line.clone());
-
                 let clean_line = strip_ansi_codes(&line);
                 initial_output.push(clean_line.clone());
 
