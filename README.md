@@ -42,11 +42,18 @@ SANDBOX_COMMAND_TIMEOUT_MS=10000
 
 For Codex-style OAuth with OpenAI, run Codex login first and omit `API_KEY` while using an OpenAI `BASE_URL`. TRUST will read `~/.codex/auth.json` and use `tokens.access_token`. You can override the auth file with `CODEX_AUTH_FILE`, or set `AUTH_MODE=codex` to require Codex OAuth fallback.
 
+TRUST also supports a persistent multi-model registry in `config/models.json` (ignored by Git because it can contain API keys). Each model can use a different base URL, model name, API key/auth mode, and priority. The active model is tried first; if it fails, TRUST falls back to the rest in ascending priority order.
+
 ## Local commands
 
 | Command | Description |
 | --- | --- |
 | `/credits` | Show project credits |
+| `/model` | List configured models and fallback priority |
+| `/model <name>` | Switch the active model |
+| `/config` | Show model configuration help |
+| `/config codex [name] [model=gpt-5] [priority=0]` | Add/update a Codex OAuth model |
+| `/config model <name> base_url=<url> model=<model> [api_key=<key>|auth=codex] [priority=<n>] [active=true]` | Add/update a model config |
 | `/exit`, `/quit` | Exit the app |
 | `/list` | List saved chats |
 | `/clear` | Clear the current chat |

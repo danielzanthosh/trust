@@ -14,6 +14,272 @@ use tokio::sync::mpsc;
 
 use crate::types::*;
 
+pub(crate) fn model_config_path() -> PathBuf {
+    PathBuf::from("config").join("models.json")
+}
+
+pub(crate) fn load_app_config() -> AppConfig {
+    let path = model_config_path();
+
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<AppConfig>(&content).ok())
+        .unwrap_or_else(|| AppConfig {
+            active_model: None,
+            models: Vec::new(),
+        })
+}
+
+pub(crate) fn save_app_config(config: &AppConfig) -> Result<(), String> {
+    let path = model_config_path();
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Failed to create config directory {}: {}",
+                parent.display(),
+                error
+            )
+        })?;
+    }
+
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|error| format!("Failed to serialize model config: {}", error))?;
+
+    fs::write(&path, json)
+        .map_err(|error| format!("Failed to write model config {}: {}", path.display(), error))
+}
+
+fn legacy_env_model_config() -> Option<ModelConfig> {
+    let base_url = env::var("BASE_URL").unwrap_or_default();
+    let model = env::var("MODEL").unwrap_or_default();
+
+    if base_url.trim().is_empty() || model.trim().is_empty() {
+        return None;
+    }
+
+    let api_key = env::var("API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    let auth_mode = env::var("AUTH_MODE")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    Some(ModelConfig {
+        name: "env".to_string(),
+        base_url,
+        model,
+        api_key,
+        auth_mode,
+        priority: u32::MAX,
+    })
+}
+
+pub(crate) fn configured_models() -> Vec<ModelConfig> {
+    let mut config = load_app_config();
+
+    if config.models.is_empty()
+        && let Some(env_model) = legacy_env_model_config()
+    {
+        config.models.push(env_model);
+    }
+
+    config.models
+}
+
+pub(crate) fn ordered_model_fallbacks() -> Vec<ModelConfig> {
+    let config = load_app_config();
+    let mut models = configured_models();
+
+    if let Some(active) = config.active_model.as_deref()
+        && let Some(index) = models.iter().position(|model| model.name == active)
+    {
+        let selected = models.remove(index);
+        models.sort_by_key(|model| model.priority);
+        models.insert(0, selected);
+        return models;
+    }
+
+    models.sort_by_key(|model| model.priority);
+    models
+}
+
+pub(crate) fn set_active_model(name: &str) -> Result<(), String> {
+    let mut config = load_app_config();
+
+    if !config.models.iter().any(|model| model.name == name) {
+        return Err(format!("Unknown model config: {}", name));
+    }
+
+    config.active_model = Some(name.to_string());
+    save_app_config(&config)
+}
+
+pub(crate) fn upsert_model_config(model: ModelConfig, make_active: bool) -> Result<(), String> {
+    let mut config = load_app_config();
+
+    if let Some(existing) = config
+        .models
+        .iter_mut()
+        .find(|existing| existing.name == model.name)
+    {
+        *existing = model.clone();
+    } else {
+        config.models.push(model.clone());
+    }
+
+    if make_active || config.active_model.is_none() {
+        config.active_model = Some(model.name);
+    }
+
+    save_app_config(&config)
+}
+
+pub(crate) fn describe_models() -> String {
+    let config = load_app_config();
+    let mut models = configured_models();
+    models.sort_by_key(|model| model.priority);
+
+    if models.is_empty() {
+        return "No models configured. Use /config model <name> base_url=<url> model=<model> api_key=<key> priority=<n> or /config codex <name> model=<model>.".to_string();
+    }
+
+    models
+        .into_iter()
+        .map(|model| {
+            let active = if config.active_model.as_deref() == Some(model.name.as_str()) {
+                "*"
+            } else {
+                " "
+            };
+            let auth = model.auth_mode.as_deref().unwrap_or_else(|| {
+                if model
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty())
+                {
+                    "api_key"
+                } else {
+                    "env/codex"
+                }
+            });
+
+            format!(
+                "{} {} · priority={} · model={} · base_url={} · auth={}",
+                active, model.name, model.priority, model.model, model.base_url, auth
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn parse_key_values(input: &str) -> Vec<(String, String)> {
+    input
+        .split_whitespace()
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.trim().to_lowercase(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+pub(crate) fn key_value<'a>(values: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    values
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.as_str())
+}
+
+pub(crate) fn parse_model_config_command(args: &str) -> Result<(ModelConfig, bool), String> {
+    let mut parts = args.split_whitespace();
+    let name = parts
+        .next()
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "Usage: /config model <name> base_url=<url> model=<model> [api_key=<key>|auth=codex] [priority=<n>] [active=true]".to_string())?;
+
+    let rest = parts.collect::<Vec<_>>().join(" ");
+    let values = parse_key_values(&rest);
+
+    let base_url = key_value(&values, "base_url")
+        .or_else(|| key_value(&values, "url"))
+        .ok_or_else(|| "Missing base_url=<url>".to_string())?
+        .to_string();
+
+    let model = key_value(&values, "model")
+        .ok_or_else(|| "Missing model=<model>".to_string())?
+        .to_string();
+
+    let api_key = key_value(&values, "api_key")
+        .or_else(|| key_value(&values, "key"))
+        .filter(|value| *value != "-" && !value.eq_ignore_ascii_case("codex"))
+        .map(str::to_string);
+
+    let auth_mode = key_value(&values, "auth")
+        .or_else(|| key_value(&values, "auth_mode"))
+        .map(str::to_string)
+        .or_else(|| {
+            key_value(&values, "api_key")
+                .filter(|value| value.eq_ignore_ascii_case("codex"))
+                .map(|_| "codex".to_string())
+        });
+
+    let priority = key_value(&values, "priority")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(100);
+
+    let make_active = key_value(&values, "active")
+        .map(|value| matches!(value.to_lowercase().as_str(), "true" | "yes" | "1"))
+        .unwrap_or(false);
+
+    Ok((
+        ModelConfig {
+            name: name.to_string(),
+            base_url,
+            model,
+            api_key,
+            auth_mode,
+            priority,
+        },
+        make_active,
+    ))
+}
+
+pub(crate) fn parse_codex_config_command(args: &str) -> Result<(ModelConfig, bool), String> {
+    let mut parts = args.split_whitespace();
+    let first = parts.next().unwrap_or("codex");
+    let (name, rest) = if first.contains('=') {
+        ("codex".to_string(), args.to_string())
+    } else {
+        (first.to_string(), parts.collect::<Vec<_>>().join(" "))
+    };
+
+    let values = parse_key_values(&rest);
+    let model = key_value(&values, "model").unwrap_or("gpt-5").to_string();
+    let base_url = key_value(&values, "base_url")
+        .or_else(|| key_value(&values, "url"))
+        .unwrap_or("https://api.openai.com/v1/responses")
+        .to_string();
+    let priority = key_value(&values, "priority")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let make_active = key_value(&values, "active")
+        .map(|value| matches!(value.to_lowercase().as_str(), "true" | "yes" | "1"))
+        .unwrap_or(true);
+
+    Ok((
+        ModelConfig {
+            name,
+            base_url,
+            model,
+            api_key: None,
+            auth_mode: Some("codex".to_string()),
+            priority,
+        },
+        make_active,
+    ))
+}
+
 pub(crate) fn detect_provider(base_url: &str) -> Provider {
     let normalized = base_url.trim().to_lowercase();
 
@@ -291,15 +557,27 @@ fn codex_oauth_token() -> Result<Option<String>, String> {
         .map(str::to_string))
 }
 
-fn resolve_api_key(base_url: &str) -> Result<String, String> {
-    let api_key = env::var("API_KEY").unwrap_or_default();
-
-    if !api_key.trim().is_empty() {
-        return Ok(api_key);
+fn resolve_api_key(config: &ModelConfig) -> Result<String, String> {
+    if let Some(api_key) = config
+        .api_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(api_key.to_string());
     }
 
-    let auth_mode = env::var("AUTH_MODE").unwrap_or_default().to_lowercase();
-    let openai_base = base_url.to_lowercase().contains("openai.com");
+    let env_api_key = env::var("API_KEY").unwrap_or_default();
+
+    if !env_api_key.trim().is_empty() && config.auth_mode.as_deref() != Some("codex") {
+        return Ok(env_api_key);
+    }
+
+    let auth_mode = config
+        .auth_mode
+        .as_deref()
+        .unwrap_or_default()
+        .to_lowercase();
+    let openai_base = config.base_url.to_lowercase().contains("openai.com");
 
     if (auth_mode == "codex" || openai_base)
         && let Some(token) = codex_oauth_token()?
@@ -308,41 +586,37 @@ fn resolve_api_key(base_url: &str) -> Result<String, String> {
     }
 
     if auth_mode == "codex" || openai_base {
-        Err("Missing API_KEY and no Codex OAuth token was found at ~/.codex/auth.json. Run Codex login first or set API_KEY.".to_string())
+        Err(format!(
+            "Model '{}' needs Codex OAuth, but no token was found at ~/.codex/auth.json. Run Codex login first or set api_key=... .",
+            config.name
+        ))
     } else {
-        Err("Missing API_KEY. Add it to your .env file or environment variables. Codex OAuth fallback is only used for OpenAI base URLs.".to_string())
+        Err(format!(
+            "Model '{}' is missing an API key. Configure api_key=... or set API_KEY.",
+            config.name
+        ))
     }
 }
 
-pub(crate) async fn request_model_reply(
+async fn request_model_reply_with_config(
+    config: &ModelConfig,
     history: &[Message],
-
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
 ) -> Result<String, String> {
-    let base_url = env::var("BASE_URL").unwrap_or_default();
-
-    let model = env::var("MODEL").unwrap_or_default();
-
-    if base_url.trim().is_empty() {
-        return Err("Missing BASE_URL. Example: BASE_URL=https://api.openai.com".to_string());
+    if config.base_url.trim().is_empty() {
+        return Err(format!("Model '{}' is missing base_url.", config.name));
     }
 
-    let api_key = resolve_api_key(&base_url)?;
-
-    if model.trim().is_empty() {
-        return Err("Missing MODEL. Example: MODEL=gpt-4o-mini".to_string());
+    if config.model.trim().is_empty() {
+        return Err(format!("Model '{}' is missing model.", config.name));
     }
 
-    let provider = detect_provider(&base_url);
-
-    let url = build_request_url(&base_url, provider);
-
+    let api_key = resolve_api_key(config)?;
+    let provider = detect_provider(&config.base_url);
+    let url = build_request_url(&config.base_url, provider);
     let client = Client::new();
-
-    let body = build_request_body(&model, history, provider);
-
+    let body = build_request_body(&config.model, history, provider);
     let headers = build_headers(&api_key, provider)?;
-
     let response = client.post(&url).headers(headers).json(&body).send().await;
 
     match response {
@@ -356,17 +630,19 @@ pub(crate) async fn request_model_reply(
                     .unwrap_or_else(|_| "<failed to read error response body>".to_string());
 
                 return Err(format!(
-                    "API error status: {}\n\nAPI error body:\n{}\n\nRequest URL:\n{}\n\nDetected provider: {:?}",
-                    status, error_body, url, provider
+                    "Model '{}' API error status: {}\n\nAPI error body:\n{}\n\nRequest URL:\n{}\n\nDetected provider: {:?}",
+                    config.name, status, error_body, url, provider
                 ));
             }
 
             let mut stream = res.bytes_stream();
-
             let mut full_message = String::new();
-
             let mut sse_buffer = String::new();
 
+            let _ = event_tx.send(RuntimeEvent::Status(format!(
+                "Streaming from model: {}",
+                config.name
+            )));
             let _ = event_tx.send(RuntimeEvent::StartAssistant);
 
             while let Some(item) = stream.next().await {
@@ -376,7 +652,6 @@ pub(crate) async fn request_model_reply(
 
                         while let Some(newline_index) = sse_buffer.find('\n') {
                             let mut line = sse_buffer[..newline_index].to_string();
-
                             sse_buffer.drain(..=newline_index);
 
                             if line.ends_with('\r') {
@@ -397,19 +672,16 @@ pub(crate) async fn request_model_reply(
 
                             if !content.is_empty() {
                                 full_message.push_str(&content);
-
                                 let _ = event_tx.send(RuntimeEvent::AssistantChunk(content));
                             }
                         }
                     }
 
                     Err(error) => {
-                        return Err(format!("Stream error: {}", error));
+                        return Err(format!("Model '{}' stream error: {}", config.name, error));
                     }
                 }
             }
-
-            // Some providers send a final data line without a trailing newline.
 
             if let Some(data) = sse_buffer.trim().strip_prefix("data:") {
                 let data = data.trim();
@@ -419,7 +691,6 @@ pub(crate) async fn request_model_reply(
 
                     if !content.is_empty() {
                         full_message.push_str(&content);
-
                         let _ = event_tx.send(RuntimeEvent::AssistantChunk(content));
                     }
                 }
@@ -431,12 +702,42 @@ pub(crate) async fn request_model_reply(
         Err(error) => {
             if error.is_builder() {
                 Err(format!(
-                    "Request error: {}\nThis usually means BASE_URL is not a valid absolute URL. Current request URL: {}",
-                    error, url
+                    "Model '{}' request error: {}\nThis usually means BASE_URL is not a valid absolute URL. Current request URL: {}",
+                    config.name, error, url
                 ))
             } else {
-                Err(format!("Request error: {}", error))
+                Err(format!("Model '{}' request error: {}", config.name, error))
             }
         }
     }
+}
+
+pub(crate) async fn request_model_reply(
+    history: &[Message],
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+) -> Result<String, String> {
+    let models = ordered_model_fallbacks();
+
+    if models.is_empty() {
+        return Err("No models configured. Use /config model <name> base_url=<url> model=<model> api_key=<key> or /config codex <name> model=<model>.".to_string());
+    }
+
+    let mut errors = Vec::new();
+
+    for config in models {
+        let _ = event_tx.send(RuntimeEvent::Status(format!(
+            "Trying model: {}",
+            config.name
+        )));
+
+        match request_model_reply_with_config(&config, history, event_tx).await {
+            Ok(message) => return Ok(message),
+            Err(error) => errors.push(error),
+        }
+    }
+
+    Err(format!(
+        "All configured models failed:\n{}",
+        errors.join("\n\n---\n")
+    ))
 }

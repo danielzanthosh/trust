@@ -69,6 +69,28 @@ pub(crate) struct ToolArgs {
     pub(crate) new_tab: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct ModelConfig {
+    pub(crate) name: String,
+
+    pub(crate) base_url: String,
+
+    pub(crate) model: String,
+
+    pub(crate) api_key: Option<String>,
+
+    pub(crate) auth_mode: Option<String>,
+
+    pub(crate) priority: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct AppConfig {
+    pub(crate) active_model: Option<String>,
+
+    pub(crate) models: Vec<ModelConfig>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 
 pub(crate) enum Provider {

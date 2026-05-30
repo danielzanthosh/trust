@@ -10,6 +10,7 @@
 /memory/*.json
 /sandbox/
 /permissions/
+/config/models.json
 
 # TestSprite/generated test artifacts
 /testsprite_tests/

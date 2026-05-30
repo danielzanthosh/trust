@@ -34,6 +34,8 @@ use crate::app::*;
 
 use crate::history::*;
 
+use crate::model::*;
+
 use crate::runtime::sandbox::*;
 
 use crate::types::*;
@@ -545,6 +547,118 @@ pub(crate) fn handle_local_command(app: &mut App, input: &str) -> bool {
         app.add_info_message(credits_text());
 
         app.status = "Displayed credits".to_string();
+
+        return true;
+    }
+
+    if input == "/model" {
+        app.add_info_message(format!(
+            "Configured models:\n{}\n\nUse /model <name> to switch.",
+            describe_models()
+        ));
+
+        app.status = "Listed models".to_string();
+
+        return true;
+    }
+
+    if let Some(model_name) = input.strip_prefix("/model ") {
+        let model_name = model_name.trim();
+
+        if model_name.is_empty() {
+            app.add_info_message("Usage: /model <name>");
+            return true;
+        }
+
+        match set_active_model(model_name) {
+            Ok(()) => {
+                app.status = format!("Switched model: {}", model_name);
+                app.add_info_message(format!("Active model: {}", model_name));
+            }
+            Err(error) => {
+                app.status = error.clone();
+                app.add_info_message(format!(
+                    "{}\n\nConfigured models:\n{}",
+                    error,
+                    describe_models()
+                ));
+            }
+        }
+
+        return true;
+    }
+
+    if input == "/config" || input == "/config model" {
+        app.add_info_message([
+            "Config commands:",
+            "/config codex [name] [model=gpt-5] [base_url=https://api.openai.com/v1/responses] [priority=0] [active=true]",
+            "/config model <name> base_url=<url> model=<model> [api_key=<key>|auth=codex] [priority=<n>] [active=true]",
+            "/model lists configured models; /model <name> switches the active model.",
+            "Lower priority numbers are tried earlier. The active model is tried first, then fallback uses priority order.",
+        ].join("\n"));
+
+        app.status = "Displayed config help".to_string();
+
+        return true;
+    }
+
+    if input == "/config codex" || input.starts_with("/config codex ") {
+        let args = input
+            .strip_prefix("/config codex")
+            .unwrap_or_default()
+            .trim();
+
+        match parse_codex_config_command(args) {
+            Ok((model, make_active)) => {
+                let name = model.name.clone();
+                match upsert_model_config(model, make_active) {
+                    Ok(()) => {
+                        app.status = format!("Configured Codex model: {}", name);
+                        app.add_info_message(format!(
+                            "Configured Codex OAuth model: {}\n{}",
+                            name,
+                            describe_models()
+                        ));
+                    }
+                    Err(error) => {
+                        app.status = error.clone();
+                        app.add_info_message(error);
+                    }
+                }
+            }
+            Err(error) => {
+                app.status = error.clone();
+                app.add_info_message(error);
+            }
+        }
+
+        return true;
+    }
+
+    if let Some(args) = input.strip_prefix("/config model ") {
+        match parse_model_config_command(args.trim()) {
+            Ok((model, make_active)) => {
+                let name = model.name.clone();
+                match upsert_model_config(model, make_active) {
+                    Ok(()) => {
+                        app.status = format!("Configured model: {}", name);
+                        app.add_info_message(format!(
+                            "Configured model: {}\n{}",
+                            name,
+                            describe_models()
+                        ));
+                    }
+                    Err(error) => {
+                        app.status = error.clone();
+                        app.add_info_message(error);
+                    }
+                }
+            }
+            Err(error) => {
+                app.status = error.clone();
+                app.add_info_message(error);
+            }
+        }
 
         return true;
     }
