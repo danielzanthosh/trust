@@ -8,7 +8,7 @@ use serde_json::json;
 
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -589,6 +589,14 @@ pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEv
 
         let mut initial_output = Vec::new();
 
+        let stderr_handle = child.stderr.take().map(|mut stderr| {
+            thread::spawn(move || {
+                let mut error_output = String::new();
+                let _ = stderr.read_to_string(&mut error_output);
+                strip_ansi_codes(&error_output)
+            })
+        });
+
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
 
@@ -604,6 +612,10 @@ pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEv
                 }
             }
         }
+
+        let stderr_output = stderr_handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
 
         match child.wait() {
             Ok(status) if status.success() => match import_codex_models() {
@@ -625,10 +637,26 @@ pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEv
                 }
             },
             Ok(status) => {
-                let _ = event_tx.send(RuntimeEvent::Info(format!(
-                    "Codex OAuth login exited with status: {}",
-                    status
-                )));
+                let mut details = strip_ansi_codes(&initial_output.join("\n"));
+
+                if !stderr_output.trim().is_empty() {
+                    if !details.trim().is_empty() {
+                        details.push_str("\n\n");
+                    }
+                    details.push_str(stderr_output.trim());
+                }
+
+                let message = if details.trim().is_empty() {
+                    format!("Codex OAuth login exited with status: {}", status)
+                } else {
+                    format!(
+                        "Codex OAuth login exited with status: {}\n\n{}",
+                        status,
+                        details.trim()
+                    )
+                };
+
+                let _ = event_tx.send(RuntimeEvent::Info(message));
             }
             Err(error) => {
                 let _ = event_tx.send(RuntimeEvent::Info(format!(

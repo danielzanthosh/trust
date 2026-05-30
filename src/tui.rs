@@ -1,8 +1,5 @@
 use crossterm::{
-    event::{
-        DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        MouseEvent, MouseEventKind,
-    },
+    event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
     execute,
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -987,7 +984,7 @@ impl Tui {
 
         let mut stdout = io::stdout();
 
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
 
         let backend = CrosstermBackend::new(stdout);
 
@@ -1007,11 +1004,7 @@ impl Drop for Tui {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
 
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
 
         let _ = self.terminal.show_cursor();
     }
