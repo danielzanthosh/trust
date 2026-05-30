@@ -194,6 +194,17 @@ pub(crate) fn configured_models() -> Vec<ModelConfig> {
     config.models
 }
 
+fn reserved_codex_config_name(name: &str) -> bool {
+    matches!(name, "code" | "show-code" | "import" | "login" | "oauth")
+}
+
+fn is_codex_cli_config(model: &ModelConfig) -> bool {
+    matches!(
+        model.auth_mode.as_deref(),
+        Some("codex") | Some("codex_cli")
+    ) || model.base_url == "codex-cli://exec"
+}
+
 pub(crate) fn ordered_model_fallbacks() -> Vec<ModelConfig> {
     let config = load_app_config();
     let mut models = configured_models();
@@ -220,6 +231,15 @@ pub(crate) fn set_active_model(name: &str) -> Result<(), String> {
 
     config.active_model = Some(name.to_string());
     save_app_config(&config)
+}
+
+fn cache_successful_model(name: &str) {
+    let mut config = load_app_config();
+
+    if config.models.iter().any(|model| model.name == name) {
+        config.active_model = Some(name.to_string());
+        let _ = save_app_config(&config);
+    }
 }
 
 pub(crate) fn upsert_model_config(model: ModelConfig, make_active: bool) -> Result<(), String> {
@@ -432,6 +452,10 @@ pub(crate) fn import_codex_models() -> Result<String, String> {
 
     let mut config = load_app_config();
 
+    config
+        .models
+        .retain(|model| !(is_codex_cli_config(model) && reserved_codex_config_name(&model.name)));
+
     for existing in &mut config.models {
         if existing.auth_mode.as_deref() == Some("codex") {
             existing.auth_mode = Some("codex_cli".to_string());
@@ -451,7 +475,17 @@ pub(crate) fn import_codex_models() -> Result<String, String> {
         }
     }
 
-    if config.active_model.is_none() {
+    let active_is_valid = config
+        .active_model
+        .as_deref()
+        .is_some_and(|active| config.models.iter().any(|model| model.name == active));
+
+    if !active_is_valid
+        || config
+            .active_model
+            .as_deref()
+            .is_some_and(reserved_codex_config_name)
+    {
         config.active_model = Some(models[0].name.clone());
     }
 
@@ -582,7 +616,7 @@ pub(crate) fn parse_codex_config_command(args: &str) -> Result<(ModelConfig, boo
     let mut parts = args.split_whitespace();
     let first = parts.next().unwrap_or("codex");
 
-    if matches!(first, "code" | "show-code" | "import" | "login" | "oauth") {
+    if reserved_codex_config_name(first) {
         return Err(format!(
             "'{}' is reserved for /config codex. Use a different model config name.",
             first
@@ -1209,7 +1243,10 @@ pub(crate) async fn request_model_reply(
         )));
 
         match request_model_reply_with_config(&config, history, event_tx).await {
-            Ok(message) => return Ok(message),
+            Ok(message) => {
+                cache_successful_model(&config.name);
+                return Ok(message);
+            }
             Err(error) => errors.push(error),
         }
     }
