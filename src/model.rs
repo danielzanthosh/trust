@@ -78,7 +78,59 @@ fn codex_command() -> Result<Command, String> {
         "Codex CLI was not found. Install Codex or set CODEX_BIN to the full path, e.g. C:\\Users\\<you>\\AppData\\Roaming\\npm\\codex.cmd".to_string()
     })?;
 
-    Ok(Command::new(path))
+    let mut command = Command::new(path);
+    command.env("NO_COLOR", "1").env("CLICOLOR", "0");
+    Ok(command)
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn codex_device_login_message(output: &[String]) -> String {
+    let clean = strip_ansi_codes(&output.join("\n"));
+    let url = clean
+        .split_whitespace()
+        .find(|part| part.starts_with("http://") || part.starts_with("https://"))
+        .unwrap_or("https://auth.openai.com/codex/device");
+
+    let code = clean
+        .lines()
+        .flat_map(|line| line.split_whitespace())
+        .find(|part| {
+            let normalized = part.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
+            normalized.contains('-')
+                && normalized.len() >= 8
+                && normalized
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+        })
+        .map(|part| part.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-'))
+        .unwrap_or("<code not found>");
+
+    format!(
+        "Codex OAuth login\n\nOpen this link:\n{}\n\nEnter this one-time code:\n{}\n\nTRUST will import available Codex models after login completes.",
+        url, code
+    )
 }
 
 pub(crate) fn load_app_config() -> AppConfig {
@@ -471,10 +523,13 @@ pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEv
             for line in reader.lines().map_while(Result::ok) {
                 initial_output.push(line.clone());
 
-                if line.contains("Never share this code") || line.contains("Logged in") {
-                    let _ = event_tx.send(RuntimeEvent::Info(format!(
-                        "Codex OAuth login:\n{}",
-                        initial_output.join("\n")
+                let clean_line = strip_ansi_codes(&line);
+                initial_output.push(clean_line.clone());
+
+                if clean_line.contains("Never share this code") || clean_line.contains("Logged in")
+                {
+                    let _ = event_tx.send(RuntimeEvent::Info(codex_device_login_message(
+                        &initial_output,
                     )));
                 }
             }
