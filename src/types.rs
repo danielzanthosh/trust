@@ -273,6 +273,8 @@ pub(crate) struct CommandLogEntry {
 pub(crate) enum RuntimeEvent {
     Status(String),
 
+    Info(String),
+
     StartAssistant,
 
     AssistantChunk(String),

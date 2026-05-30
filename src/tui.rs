@@ -526,7 +526,11 @@ pub(crate) fn credits_text() -> String {
     .join("\n")
 }
 
-pub(crate) fn handle_local_command(app: &mut App, input: &str) -> bool {
+pub(crate) fn handle_local_command(
+    app: &mut App,
+    input: &str,
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+) -> bool {
     if input == "/exit" || input == "/quit" {
         app.should_quit = true;
 
@@ -608,27 +612,56 @@ pub(crate) fn handle_local_command(app: &mut App, input: &str) -> bool {
             .unwrap_or_default()
             .trim();
 
-        match parse_codex_config_command(args) {
-            Ok((model, make_active)) => {
-                let name = model.name.clone();
-                match upsert_model_config(model, make_active) {
-                    Ok(()) => {
-                        app.status = format!("Configured Codex model: {}", name);
-                        app.add_info_message(format!(
-                            "Configured Codex OAuth model: {}\n{}",
-                            name,
-                            describe_models()
-                        ));
-                    }
-                    Err(error) => {
-                        app.status = error.clone();
-                        app.add_info_message(error);
+        if args.is_empty() {
+            match codex_login_status() {
+                Ok(status) if status.to_lowercase().contains("logged in") => {
+                    match import_codex_models() {
+                        Ok(summary) => {
+                            app.status = "Imported Codex models".to_string();
+                            app.add_info_message(format!(
+                                "{}\n\nConfigured models:\n{}",
+                                summary,
+                                describe_models()
+                            ));
+                        }
+                        Err(error) => {
+                            app.status = error.clone();
+                            app.add_info_message(error);
+                        }
                     }
                 }
+                _ => {
+                    app.status = "Starting Codex OAuth login...".to_string();
+                    app.add_info_message(
+                        "Starting Codex OAuth. TRUST will show the browser link and one-time code here, then import available Codex models after login completes."
+                            .to_string(),
+                    );
+                    start_codex_device_login(event_tx.clone());
+                }
             }
-            Err(error) => {
-                app.status = error.clone();
-                app.add_info_message(error);
+        } else {
+            match parse_codex_config_command(args) {
+                Ok((model, make_active)) => {
+                    let name = model.name.clone();
+                    match upsert_model_config(model, make_active) {
+                        Ok(()) => {
+                            app.status = format!("Configured Codex model: {}", name);
+                            app.add_info_message(format!(
+                                "Configured Codex OAuth model: {}\n{}",
+                                name,
+                                describe_models()
+                            ));
+                        }
+                        Err(error) => {
+                            app.status = error.clone();
+                            app.add_info_message(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    app.status = error.clone();
+                    app.add_info_message(error);
+                }
             }
         }
 
@@ -727,7 +760,7 @@ pub(crate) fn submit_current_input(app: &mut App, event_tx: &mpsc::UnboundedSend
         return;
     }
 
-    if handle_local_command(app, &input) {
+    if handle_local_command(app, &input, event_tx) {
         app.input.clear();
 
         return;

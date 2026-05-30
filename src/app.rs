@@ -121,6 +121,8 @@ impl App {
         match event {
             RuntimeEvent::Status(status) => self.status = status,
 
+            RuntimeEvent::Info(info) => self.add_info_message(info),
+
             RuntimeEvent::StartAssistant => {
                 self.draft_assistant.clear();
 

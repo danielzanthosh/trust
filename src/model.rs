@@ -8,7 +8,10 @@ use serde_json::json;
 
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
 
 use tokio::sync::mpsc;
 
@@ -243,6 +246,203 @@ pub(crate) fn parse_model_config_command(args: &str) -> Result<(ModelConfig, boo
         },
         make_active,
     ))
+}
+
+fn codex_models_from_json(content: &str) -> Result<Vec<ModelConfig>, String> {
+    let parsed: serde_json::Value = serde_json::from_str(content)
+        .map_err(|error| format!("Failed to parse Codex model catalog: {}", error))?;
+
+    let models = parsed
+        .get("models")
+        .and_then(|models| models.as_array())
+        .ok_or_else(|| "Codex model catalog did not contain a models array.".to_string())?;
+
+    let mut configs = Vec::new();
+
+    for (index, model) in models.iter().enumerate() {
+        let Some(slug) = model.get("slug").and_then(|value| value.as_str()) else {
+            continue;
+        };
+
+        if model
+            .get("supported_in_api")
+            .and_then(|value| value.as_bool())
+            == Some(false)
+        {
+            continue;
+        }
+
+        if model
+            .get("visibility")
+            .and_then(|value| value.as_str())
+            .is_some_and(|visibility| visibility == "hidden")
+        {
+            continue;
+        }
+
+        let priority = model
+            .get("priority")
+            .and_then(|value| value.as_u64())
+            .map(|priority| priority as u32)
+            .unwrap_or(index as u32);
+
+        configs.push(ModelConfig {
+            name: format!("codex:{}", slug),
+            base_url: "https://api.openai.com/v1/responses".to_string(),
+            model: slug.to_string(),
+            api_key: None,
+            auth_mode: Some("codex".to_string()),
+            priority,
+        });
+    }
+
+    configs.sort_by_key(|model| model.priority);
+    Ok(configs)
+}
+
+pub(crate) fn import_codex_models() -> Result<String, String> {
+    let output = Command::new("codex")
+        .args(["debug", "models"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("Failed to run `codex debug models`: {}", error))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        return Err(format!(
+            "`codex debug models` failed with {}: {}{}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+
+    let models = codex_models_from_json(&stdout)?;
+
+    if models.is_empty() {
+        return Err("Codex returned no API-supported models.".to_string());
+    }
+
+    let mut config = load_app_config();
+
+    for model in &models {
+        if let Some(existing) = config
+            .models
+            .iter_mut()
+            .find(|existing| existing.name == model.name)
+        {
+            *existing = model.clone();
+        } else {
+            config.models.push(model.clone());
+        }
+    }
+
+    if config.active_model.is_none() {
+        config.active_model = Some(models[0].name.clone());
+    }
+
+    save_app_config(&config)?;
+
+    Ok(format!(
+        "Imported {} Codex OAuth models:\n{}",
+        models.len(),
+        models
+            .iter()
+            .map(|model| format!(
+                "- {} ({}) priority={}",
+                model.name, model.model, model.priority
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
+}
+
+pub(crate) fn codex_login_status() -> Result<String, String> {
+    let output = Command::new("codex")
+        .args(["login", "status"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("Failed to run `codex login status`: {}", error))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        Err(format!("{}{}", stdout, stderr))
+    }
+}
+
+pub(crate) fn start_codex_device_login(event_tx: mpsc::UnboundedSender<RuntimeEvent>) {
+    thread::spawn(move || {
+        let mut child = match Command::new("codex")
+            .args(["login", "--device-auth"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = event_tx.send(RuntimeEvent::Info(format!(
+                    "Failed to start Codex OAuth login: {}",
+                    error
+                )));
+                return;
+            }
+        };
+
+        let mut initial_output = Vec::new();
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+
+            for line in reader.lines().map_while(Result::ok) {
+                initial_output.push(line.clone());
+
+                if line.contains("Never share this code") || line.contains("Logged in") {
+                    let _ = event_tx.send(RuntimeEvent::Info(format!(
+                        "Codex OAuth login:\n{}",
+                        initial_output.join("\n")
+                    )));
+                }
+            }
+        }
+
+        match child.wait() {
+            Ok(status) if status.success() => match import_codex_models() {
+                Ok(summary) => {
+                    let _ = event_tx.send(RuntimeEvent::Info(format!(
+                        "Codex OAuth login completed.\n{}",
+                        summary
+                    )));
+                    let _ =
+                        event_tx.send(RuntimeEvent::Status("Codex OAuth configured".to_string()));
+                }
+                Err(error) => {
+                    let _ = event_tx.send(RuntimeEvent::Info(format!(
+                        "Codex OAuth login completed, but model import failed: {}",
+                        error
+                    )));
+                }
+            },
+            Ok(status) => {
+                let _ = event_tx.send(RuntimeEvent::Info(format!(
+                    "Codex OAuth login exited with status: {}",
+                    status
+                )));
+            }
+            Err(error) => {
+                let _ = event_tx.send(RuntimeEvent::Info(format!(
+                    "Failed waiting for Codex OAuth login: {}",
+                    error
+                )));
+            }
+        }
+    });
 }
 
 pub(crate) fn parse_codex_config_command(args: &str) -> Result<(ModelConfig, bool), String> {
