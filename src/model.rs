@@ -566,17 +566,17 @@ fn resolve_api_key(config: &ModelConfig) -> Result<String, String> {
         return Ok(api_key.to_string());
     }
 
-    let env_api_key = env::var("API_KEY").unwrap_or_default();
-
-    if !env_api_key.trim().is_empty() && config.auth_mode.as_deref() != Some("codex") {
-        return Ok(env_api_key);
-    }
-
     let auth_mode = config
         .auth_mode
         .as_deref()
         .unwrap_or_default()
         .to_lowercase();
+
+    let env_api_key = env::var("API_KEY").unwrap_or_default();
+
+    if !env_api_key.trim().is_empty() && auth_mode != "codex" {
+        return Ok(env_api_key);
+    }
     let openai_base = config.base_url.to_lowercase().contains("openai.com");
 
     if (auth_mode == "codex" || openai_base)
