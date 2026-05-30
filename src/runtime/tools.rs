@@ -243,6 +243,10 @@ pub(crate) fn response_looks_like_tool_avoidance(response: &str) -> bool {
         "would you like me",
         "let me initiate",
         "let me start",
+        "let me run",
+        "i need to run",
+        "i'll run",
+        "i will run",
         "here's how",
         "here is how",
         "follow these steps",
@@ -490,7 +494,7 @@ pub(crate) fn normalize_assistant_response(response: &str) -> String {
 }
 
 fn strip_visible_reasoning(response: &str) -> String {
-    let mut cleaned = response.trim().to_string();
+    let mut cleaned = strip_think_blocks(response.trim());
 
     for marker in [
         "The user ",
@@ -522,6 +526,48 @@ fn strip_visible_reasoning(response: &str) -> String {
     }
 
     cleaned.trim().to_string()
+}
+
+fn strip_think_blocks(response: &str) -> String {
+    let mut remaining = response;
+    let mut output = String::new();
+
+    loop {
+        let open = find_ascii_case_insensitive(remaining, "<think>");
+        let close = find_ascii_case_insensitive(remaining, "</think>");
+
+        if let Some(close_index) = close
+            && open.is_none_or(|open_index| close_index < open_index)
+        {
+            remaining = &remaining[close_index + "</think>".len()..];
+            continue;
+        }
+
+        let Some(open_index) = open else {
+            output.push_str(remaining);
+            break;
+        };
+
+        output.push_str(&remaining[..open_index]);
+
+        let after_open = open_index + "<think>".len();
+        let after_open_text = &remaining[after_open..];
+
+        let Some(close_offset) = find_ascii_case_insensitive(after_open_text, "</think>") else {
+            break;
+        };
+
+        remaining = &after_open_text[close_offset + "</think>".len()..];
+    }
+
+    output
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 pub(crate) fn response_claims_destructive_action(response: &str) -> bool {
@@ -979,60 +1025,64 @@ pub(crate) async fn process_turn(
         }
 
         if let Some(user_request) = latest_user_runtime_action_request(&history)
-            && response_looks_like_tool_avoidance(&full_message)
             && step + 1 < MAX_AGENT_STEPS
         {
-            let _ = event_tx.send(RuntimeEvent::DiscardAssistantDraft);
+            let should_enforce_tool = response_looks_like_tool_avoidance(&full_message)
+                || inferred_tool_call_for_request(user_request).is_some();
 
-            if let Some(tool_call) = inferred_tool_call_for_request(user_request) {
-                let tool_call_content = serde_json::to_string(&tool_call)
-                    .unwrap_or_else(|_| "<failed to serialize inferred tool call>".to_string());
+            if should_enforce_tool {
+                let _ = event_tx.send(RuntimeEvent::DiscardAssistantDraft);
 
-                history.push(Message {
-                    role: "assistant".to_string(),
+                if let Some(tool_call) = inferred_tool_call_for_request(user_request) {
+                    let tool_call_content = serde_json::to_string(&tool_call)
+                        .unwrap_or_else(|_| "<failed to serialize inferred tool call>".to_string());
 
-                    content: tool_call_content,
-                });
+                    history.push(Message {
+                        role: "assistant".to_string(),
 
-                let _ = event_tx.send(RuntimeEvent::Status(format!(
-                    "Runtime enforcing tool: {}",
-                    tool_call.tool
-                )));
+                        content: tool_call_content,
+                    });
 
-                let tool_result = run_tool(tool_call.clone(), &sandbox, &event_tx).await;
+                    let _ = event_tx.send(RuntimeEvent::Status(format!(
+                        "Runtime enforcing tool: {}",
+                        tool_call.tool
+                    )));
 
-                let _ = event_tx.send(RuntimeEvent::ToolResult(tool_result.clone()));
+                    let tool_result = run_tool(tool_call.clone(), &sandbox, &event_tx).await;
+
+                    let _ = event_tx.send(RuntimeEvent::ToolResult(tool_result.clone()));
+
+                    history.push(Message {
+                        role: "user".to_string(),
+
+                        content: format!("{}{}", TOOL_RESULT_PREFIX, tool_result.clone()),
+                    });
+
+                    let summary = friendly_tool_summary(&tool_call, &tool_result);
+
+                    history.push(Message {
+                        role: "assistant".to_string(),
+
+                        content: summary.clone(),
+                    });
+
+                    let _ = event_tx.send(RuntimeEvent::CommitAssistant(summary));
+
+                    break;
+                }
+
+                let _ = event_tx.send(RuntimeEvent::Status(
+                    "Correcting model: tool action required...".to_string(),
+                ));
 
                 history.push(Message {
                     role: "user".to_string(),
 
-                    content: format!("{}{}", TOOL_RESULT_PREFIX, tool_result.clone()),
+                    content: tool_reprompt_message(user_request),
                 });
 
-                let summary = friendly_tool_summary(&tool_call, &tool_result);
-
-                history.push(Message {
-                    role: "assistant".to_string(),
-
-                    content: summary.clone(),
-                });
-
-                let _ = event_tx.send(RuntimeEvent::CommitAssistant(summary));
-
-                break;
+                continue;
             }
-
-            let _ = event_tx.send(RuntimeEvent::Status(
-                "Correcting model: tool action required...".to_string(),
-            ));
-
-            history.push(Message {
-                role: "user".to_string(),
-
-                content: tool_reprompt_message(user_request),
-            });
-
-            continue;
         }
 
         let normalized_message = normalize_assistant_response(&full_message);

@@ -38,7 +38,9 @@ ALLOW_DESTRUCTIVE_ACTIONS=false
 SANDBOX_COMMAND_TIMEOUT_MS=10000
 ```
 
-`BASE_URL` can point to an OpenAI-compatible or Anthropic-compatible API. TRUST detects the provider shape and builds the request accordingly.
+`BASE_URL` can point to an OpenAI-compatible, OpenAI Responses-compatible, or Anthropic-compatible API. TRUST detects the provider shape and builds the request accordingly.
+
+For Codex-style OAuth with OpenAI, run Codex login first and omit `API_KEY` while using an OpenAI `BASE_URL`. TRUST will read `~/.codex/auth.json` and use `tokens.access_token`. You can override the auth file with `CODEX_AUTH_FILE`, or set `AUTH_MODE=codex` to require Codex OAuth fallback.
 
 ## Local commands
 

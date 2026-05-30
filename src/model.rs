@@ -7,6 +7,8 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::json;
 
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
@@ -240,26 +242,92 @@ pub(crate) fn extract_stream_text(data: &str) -> String {
     String::new()
 }
 
+fn codex_auth_path() -> Option<PathBuf> {
+    env::var_os("CODEX_AUTH_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join("auth.json"))
+        })
+        .or_else(|| {
+            env::var_os("HOME")
+                .or_else(|| env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+                .map(|path| path.join(".codex").join("auth.json"))
+        })
+}
+
+fn codex_oauth_token() -> Result<Option<String>, String> {
+    let Some(path) = codex_auth_path() else {
+        return Ok(None);
+    };
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "Failed to read Codex auth file {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "Failed to parse Codex auth file {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+
+    Ok(parsed
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(|token| token.as_str())
+        .filter(|token| !token.trim().is_empty())
+        .map(str::to_string))
+}
+
+fn resolve_api_key(base_url: &str) -> Result<String, String> {
+    let api_key = env::var("API_KEY").unwrap_or_default();
+
+    if !api_key.trim().is_empty() {
+        return Ok(api_key);
+    }
+
+    let auth_mode = env::var("AUTH_MODE").unwrap_or_default().to_lowercase();
+    let openai_base = base_url.to_lowercase().contains("openai.com");
+
+    if (auth_mode == "codex" || openai_base)
+        && let Some(token) = codex_oauth_token()?
+    {
+        return Ok(token);
+    }
+
+    if auth_mode == "codex" || openai_base {
+        Err("Missing API_KEY and no Codex OAuth token was found at ~/.codex/auth.json. Run Codex login first or set API_KEY.".to_string())
+    } else {
+        Err("Missing API_KEY. Add it to your .env file or environment variables. Codex OAuth fallback is only used for OpenAI base URLs.".to_string())
+    }
+}
+
 pub(crate) async fn request_model_reply(
     history: &[Message],
 
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
 ) -> Result<String, String> {
-    let api_key = env::var("API_KEY").unwrap_or_default();
-
     let base_url = env::var("BASE_URL").unwrap_or_default();
 
     let model = env::var("MODEL").unwrap_or_default();
 
-    if api_key.trim().is_empty() {
-        return Err(
-            "Missing API_KEY. Add it to your .env file or environment variables.".to_string(),
-        );
-    }
-
     if base_url.trim().is_empty() {
         return Err("Missing BASE_URL. Example: BASE_URL=https://api.openai.com".to_string());
     }
+
+    let api_key = resolve_api_key(&base_url)?;
 
     if model.trim().is_empty() {
         return Err("Missing MODEL. Example: MODEL=gpt-4o-mini".to_string());
