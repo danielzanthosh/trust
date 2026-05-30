@@ -8,7 +8,7 @@ use serde_json::json;
 
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -106,6 +106,58 @@ fn strip_ansi_codes(input: &str) -> String {
     output
 }
 
+pub(crate) fn codex_device_code_path() -> PathBuf {
+    PathBuf::from("config").join("codex_device_code.txt")
+}
+
+pub(crate) fn read_last_codex_device_code() -> Result<String, String> {
+    fs::read_to_string(codex_device_code_path())
+        .map(|code| code.trim().to_string())
+        .map_err(|_| {
+            "No Codex device code is currently stored. Run /config codex first.".to_string()
+        })
+}
+
+fn save_last_codex_device_code(code: &str) {
+    let path = codex_device_code_path();
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let _ = fs::write(path, code);
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    if cfg!(windows) {
+        let mut child = Command::new("cmd")
+            .args(["/C", "clip"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Failed to start clipboard command: {}", error))?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|error| format!("Failed to write to clipboard: {}", error))?;
+        }
+
+        let status = child
+            .wait()
+            .map_err(|error| format!("Failed waiting for clipboard command: {}", error))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("Clipboard command exited with {}", status))
+        }
+    } else {
+        Err("Clipboard auto-copy is currently implemented for Windows only.".to_string())
+    }
+}
+
 fn codex_device_login_message(output: &[String]) -> String {
     let clean = strip_ansi_codes(&output.join("\n"));
     let url = clean
@@ -116,20 +168,34 @@ fn codex_device_login_message(output: &[String]) -> String {
     let code = clean
         .lines()
         .flat_map(|line| line.split_whitespace())
-        .find(|part| {
+        .find_map(|part| {
             let normalized = part.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
-            normalized.contains('-')
+
+            (normalized.contains('-')
                 && normalized.len() >= 8
                 && normalized
                     .chars()
-                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
-        })
-        .map(|part| part.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-'))
-        .unwrap_or("<code not found>");
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-'))
+            .then(|| normalized.to_string())
+        });
+
+    let code_status = if let Some(code) = code.as_deref() {
+        save_last_codex_device_code(code);
+
+        match copy_to_clipboard(code) {
+            Ok(()) => "Copied one-time code to clipboard.".to_string(),
+            Err(error) => format!(
+                "Could not copy one-time code automatically: {}\nType /config codex code to show it.",
+                error
+            ),
+        }
+    } else {
+        "Could not detect the one-time code. Type /config codex code to show the last stored code if available.".to_string()
+    };
 
     format!(
-        "Codex OAuth login\n\nOpen this link:\n{}\n\nEnter this one-time code:\n{}\n\nTRUST will import available Codex models after login completes.",
-        url, code
+        "Codex OAuth login\n\nOpen this link:\n{}\n\n{}\nType /config codex code to show the code if clipboard paste fails.\n\nTRUST will import available Codex models after login completes.",
+        url, code_status
     )
 }
 

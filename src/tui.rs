@@ -595,6 +595,8 @@ pub(crate) fn handle_local_command(
     if input == "/config" || input == "/config model" {
         app.add_info_message([
             "Config commands:",
+            "/config codex starts OAuth, copies the one-time code to clipboard, then imports available models",
+            "/config codex code shows the last one-time code if clipboard paste fails",
             "/config codex [name] [model=gpt-5] [base_url=https://api.openai.com/v1/responses] [priority=0] [active=true]",
             "/config model <name> base_url=<url> model=<model> [api_key=<key>|auth=codex] [priority=<n>] [active=true]",
             "/model lists configured models; /model <name> switches the active model.",
@@ -611,6 +613,15 @@ pub(crate) fn handle_local_command(
             .strip_prefix("/config codex")
             .unwrap_or_default()
             .trim();
+
+        if args == "code" || args == "show-code" {
+            match read_last_codex_device_code() {
+                Ok(code) => app.add_info_message(format!("Codex one-time code:\n{}", code)),
+                Err(error) => app.add_info_message(error),
+            }
+
+            return true;
+        }
 
         if args.is_empty() {
             match codex_login_status() {

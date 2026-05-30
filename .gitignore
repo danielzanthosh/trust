@@ -11,6 +11,7 @@
 /sandbox/
 /permissions/
 /config/models.json
+/config/codex_device_code.txt
 
 # TestSprite/generated test artifacts
 /testsprite_tests/
