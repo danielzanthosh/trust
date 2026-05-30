@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -390,10 +391,10 @@ fn codex_models_from_json(content: &str) -> Result<Vec<ModelConfig>, String> {
 
         configs.push(ModelConfig {
             name: format!("codex:{}", slug),
-            base_url: "https://api.openai.com/v1/responses".to_string(),
+            base_url: "codex-cli://exec".to_string(),
             model: slug.to_string(),
             api_key: None,
-            auth_mode: Some("codex".to_string()),
+            auth_mode: Some("codex_cli".to_string()),
             priority,
         });
     }
@@ -430,6 +431,13 @@ pub(crate) fn import_codex_models() -> Result<String, String> {
     }
 
     let mut config = load_app_config();
+
+    for existing in &mut config.models {
+        if existing.auth_mode.as_deref() == Some("codex") {
+            existing.auth_mode = Some("codex_cli".to_string());
+            existing.base_url = "codex-cli://exec".to_string();
+        }
+    }
 
     for model in &models {
         if let Some(existing) = config
@@ -591,7 +599,7 @@ pub(crate) fn parse_codex_config_command(args: &str) -> Result<(ModelConfig, boo
     let model = key_value(&values, "model").unwrap_or("gpt-5").to_string();
     let base_url = key_value(&values, "base_url")
         .or_else(|| key_value(&values, "url"))
-        .unwrap_or("https://api.openai.com/v1/responses")
+        .unwrap_or("codex-cli://exec")
         .to_string();
     let priority = key_value(&values, "priority")
         .and_then(|value| value.parse::<u32>().ok())
@@ -606,7 +614,7 @@ pub(crate) fn parse_codex_config_command(args: &str) -> Result<(ModelConfig, boo
             base_url,
             model,
             api_key: None,
-            auth_mode: Some("codex".to_string()),
+            auth_mode: Some("codex_cli".to_string()),
             priority,
         },
         make_active,
@@ -931,11 +939,150 @@ fn resolve_api_key(config: &ModelConfig) -> Result<String, String> {
     }
 }
 
+fn codex_prompt_from_history(history: &[Message]) -> String {
+    history
+        .iter()
+        .map(|message| format!("{}:\n{}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
+}
+
+fn request_codex_cli_reply(
+    config: &ModelConfig,
+    history: &[Message],
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+) -> Result<String, String> {
+    let output_path = PathBuf::from("sandbox")
+        .join("temp")
+        .join(format!("codex_reply_{}.txt", current_timestamp_millis()));
+
+    if let Some(parent) = output_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let prompt = codex_prompt_from_history(history);
+    let mut command = codex_command()?;
+
+    let mut child = command
+        .args([
+            "exec",
+            "--json",
+            "--color",
+            "never",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "--output-last-message",
+        ])
+        .arg(&output_path)
+        .arg("-m")
+        .arg(&config.model)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "Failed to start Codex CLI model '{}': {}",
+                config.name, error
+            )
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin
+            .write_all(prompt.as_bytes())
+            .map_err(|error| format!("Failed to send prompt to Codex CLI: {}", error))?;
+    }
+
+    let _ = event_tx.send(RuntimeEvent::Status(format!(
+        "Running Codex CLI model: {}",
+        config.name
+    )));
+    let _ = event_tx.send(RuntimeEvent::StartAssistant);
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(180);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_string(&mut stderr);
+                }
+
+                if !status.success() {
+                    return Err(format!(
+                        "Codex CLI model '{}' exited with {}\n{}{}",
+                        config.name,
+                        status,
+                        strip_ansi_codes(&stdout),
+                        strip_ansi_codes(&stderr)
+                    ));
+                }
+
+                let reply =
+                    fs::read_to_string(&output_path).unwrap_or_else(|_| strip_ansi_codes(&stdout));
+                let reply = reply.trim().to_string();
+
+                if reply.is_empty() {
+                    return Err(format!(
+                        "Codex CLI model '{}' returned an empty response.",
+                        config.name
+                    ));
+                }
+
+                let _ = event_tx.send(RuntimeEvent::AssistantChunk(reply.clone()));
+                let _ = fs::remove_file(output_path);
+                return Ok(reply);
+            }
+            Ok(None) => {
+                if started.elapsed() > timeout {
+                    let _ = child.kill();
+                    return Err(format!(
+                        "Codex CLI model '{}' timed out after 180 seconds.",
+                        config.name
+                    ));
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!(
+                    "Failed while waiting for Codex CLI model '{}': {}",
+                    config.name, error
+                ));
+            }
+        }
+    }
+}
+
+fn current_timestamp_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
 async fn request_model_reply_with_config(
     config: &ModelConfig,
     history: &[Message],
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
 ) -> Result<String, String> {
+    if config.auth_mode.as_deref() == Some("codex_cli") || config.base_url == "codex-cli://exec" {
+        return request_codex_cli_reply(config, history, event_tx);
+    }
+
     if config.base_url.trim().is_empty() {
         return Err(format!("Model '{}' is missing base_url.", config.name));
     }
