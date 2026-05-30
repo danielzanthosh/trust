@@ -11,6 +11,7 @@ use crate::history::*;
 use crate::model::*;
 
 use crate::runtime::sandbox::*;
+use crate::runtime::webbridge::ensure_webbridge_daemon_started;
 
 use crate::types::*;
 
@@ -521,7 +522,7 @@ pub(crate) async fn run_sandboxed_command(
 
 pub(crate) fn webbridge_unavailable_message(error: &str) -> String {
     format!(
-        "Kimi WebBridge is not available or not connected. Install the Kimi WebBridge browser extension, install/start the device daemon, then retry. Check it with `~/.kimi-webbridge/bin/kimi-webbridge status`. Details: {}",
+        "Kimi WebBridge is not available or not connected. TRUST tried to start the local daemon automatically. Install Kimi WebBridge from https://www.kimi.com/features/webbridge, make sure the browser extension is enabled, then retry. Check it with `~/.kimi-webbridge/bin/kimi-webbridge status`. Details: {}",
         error
     )
 }
@@ -533,6 +534,8 @@ pub(crate) async fn send_webbridge_command(
 
     session: Option<String>,
 ) -> String {
+    let startup_error = ensure_webbridge_daemon_started().err();
+
     let client = Client::new();
 
     let mut body = json!({
@@ -552,7 +555,13 @@ pub(crate) async fn send_webbridge_command(
     let response = match response {
         Ok(response) => response,
 
-        Err(error) => return webbridge_unavailable_message(&error.to_string()),
+        Err(error) => {
+            let detail = startup_error
+                .map(|startup_error| format!("{}; request error: {}", startup_error, error))
+                .unwrap_or_else(|| error.to_string());
+
+            return webbridge_unavailable_message(&detail);
+        }
     };
 
     let status = response.status();

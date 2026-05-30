@@ -34,6 +34,7 @@ use app::App;
 
 use runtime::events::RuntimeEvent;
 use runtime::sandbox::ensure_sandbox_ready;
+use runtime::webbridge::ensure_webbridge_daemon_started;
 use types::SandboxConfig;
 
 use tui::{Tui, handle_key_event, handle_mouse_event};
@@ -51,9 +52,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .map_err(io::Error::other)?;
 
+    let webbridge_startup = ensure_webbridge_daemon_started();
+
     let mut tui = Tui::new()?;
 
     let mut app = App::new(sandbox);
+
+    match webbridge_startup {
+        Ok(state)
+            if !state.running
+                || state.extension_connected == Some(false)
+                || state.message.contains("Started") =>
+        {
+            app.add_info_message(state.message);
+        }
+        Ok(_) => {}
+        Err(error) => app.add_info_message(format!("Kimi WebBridge auto-start skipped: {}", error)),
+    }
 
     app.status = "Ready · /chat <name> · /list · /clear · /delete <name> · /credits · Ctrl+C quit"
         .to_string();
